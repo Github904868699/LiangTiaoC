@@ -23,8 +23,11 @@ import sys
 from pathlib import Path
 import struct
 import ctypes
+import json
+import socketserver
+import threading
 from ctypes import POINTER, byref, cast, c_ubyte
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -46,6 +49,10 @@ except Exception as exc:
 TARGET_DISPLAY_WIDTH = 1280
 UI_TARGET_FPS = 15.0
 UI_PAINT_FPS = 12.0
+CONFIG_PATH = "config.json"
+
+TRIGGER_REGISTER_ADDR = 0
+RESULT_REGISTER_ADDR = 1
 
 APP_TITLE = "Camera"
 APP_ICON = "Camera.ico"
@@ -107,6 +114,26 @@ def resource_path(rel: str) -> str:
     return str(Path(base, rel))
 
 
+def safe_load_json(path: str, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def load_config(path: str = CONFIG_PATH) -> Dict:
+    cfg = safe_load_json(path, default=None)
+    if not cfg:
+        cfg = {
+            "server": {"host": "0.0.0.0", "port": 502},
+            "class_map": {},
+        }
+    cfg.setdefault("server", {"host": "0.0.0.0", "port": 502})
+    cfg.setdefault("class_map", {})
+    return cfg
+
+
 def get_local_ip() -> str:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -139,6 +166,129 @@ def scan_usb_indices(max_index: int = 10) -> List[int]:
         if ok:
             found.append(i)
     return found or [0]
+
+
+# ---------------------- Modbus ----------------------
+class ModbusRegisterModel:
+    def __init__(self, size: int = 16):
+        self._lock = threading.Lock()
+        self._regs = [0] * max(size, 2)
+
+    def read(self, addr: int, count: int) -> List[int]:
+        with self._lock:
+            if addr < 0:
+                return [0] * max(count, 0)
+            end = addr + count
+            slice_regs = self._regs[addr:end]
+            if len(slice_regs) < count:
+                slice_regs.extend([0] * (count - len(slice_regs)))
+            return list(slice_regs)
+
+    def write(self, addr: int, values: List[int]):
+        if addr < 0:
+            return
+        with self._lock:
+            end = addr + len(values)
+            if end > len(self._regs):
+                self._regs.extend([0] * (end - len(self._regs)))
+            for i, v in enumerate(values):
+                self._regs[addr + i] = v & 0xFFFF
+
+    def set_register(self, addr: int, value: int):
+        self.write(addr, [value])
+
+
+class ModbusRequestHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        while True:
+            header = self._recvn(7)
+            if not header:
+                break
+            try:
+                tid, pid, length = struct.unpack(">HHH", header[:6])
+            except struct.error:
+                break
+            unit = header[6]
+            if length <= 0:
+                continue
+            payload = self._recvn(length - 1)
+            if payload is None:
+                break
+            if not payload:
+                continue
+            function = payload[0]
+            data = payload[1:]
+            response_pdu = self._handle_function(function, data)
+            if response_pdu is None:
+                continue
+            mbap = struct.pack(">HHHB", tid, 0, len(response_pdu) + 1, unit)
+            try:
+                self.request.sendall(mbap + response_pdu)
+            except Exception:
+                break
+
+    def _recvn(self, size: int):
+        buf = b""
+        while len(buf) < size:
+            chunk = self.request.recv(size - len(buf))
+            if not chunk:
+                return None if not buf else buf
+            buf += chunk
+        return buf
+
+    def _handle_function(self, function: int, data: bytes) -> bytes | None:
+        try:
+            if function == 3:  # Read Holding Registers
+                if len(data) < 4:
+                    raise ValueError
+                addr, count = struct.unpack(">HH", data[:4])
+                regs = self.server.model.read(addr, count)
+                payload = struct.pack(">B", len(regs) * 2)
+                if regs:
+                    payload += struct.pack(">" + "H" * len(regs), *regs)
+                return bytes([function]) + payload
+            elif function == 6:  # Write Single Register
+                if len(data) < 4:
+                    raise ValueError
+                addr, value = struct.unpack(">HH", data[:4])
+                self.server.model.write(addr, [value])
+                if self.server.on_write:
+                    self.server.on_write(addr, value & 0xFFFF)
+                return bytes([function]) + data[:4]
+            elif function == 16:  # Write Multiple Registers
+                if len(data) < 5:
+                    raise ValueError
+                addr, count, byte_count = struct.unpack(">HHB", data[:5])
+                expected = count * 2
+                if byte_count != expected or len(data[5:]) < expected:
+                    raise ValueError
+                raw = data[5:5 + expected]
+                values = list(struct.unpack(">" + "H" * count, raw))
+                self.server.model.write(addr, values)
+                if self.server.on_write:
+                    for i, v in enumerate(values):
+                        self.server.on_write(addr + i, v & 0xFFFF)
+                return bytes([function]) + struct.pack(">HH", addr, count)
+            else:
+                return bytes([function | 0x80, 1])
+        except Exception:
+            return bytes([function | 0x80, 3])
+
+
+class ModbusTCPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+
+    def __init__(self, host: str, port: int, model: ModbusRegisterModel, on_write=None):
+        self.model = model
+        self.on_write = on_write
+        super().__init__((host, port), ModbusRequestHandler)
+
+
+def start_modbus_server(host: str, port: int, model: ModbusRegisterModel, on_write=None):
+    server = ModbusTCPServer(host, port, model, on_write=on_write)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"[MODBUS] listen on {host}:{port}")
+    return server
 
 
 # ---------------------- Grabbers ----------------------
@@ -538,8 +688,20 @@ class UsbGrabber(QtCore.QThread):
 
 # ---------------------- Main UI ----------------------
 class MainWindow(QtWidgets.QMainWindow):
+    modbus_trigger_sig = QtCore.pyqtSignal()
+
     def __init__(self):
         super().__init__()
+
+        self.config = load_config(CONFIG_PATH)
+        server_cfg = self.config.get("server", {})
+        self.class_map: Dict[str, int] = {k: int(v) for k, v in self.config.get("class_map", {}).items()}
+        self.modbus_host = str(server_cfg.get("host", "0.0.0.0") or "0.0.0.0")
+        self.modbus_port = int(server_cfg.get("port", 502))
+        self.modbus_model = ModbusRegisterModel(size=8)
+        self.modbus_server = None
+        self.modbus_error: Optional[str] = None
+        self.modbus_trigger_sig.connect(self._on_modbus_trigger)
 
         # 默认摄像头配置
         self.source = "hik"   # "hik" / "usb"
@@ -555,6 +717,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.last_frame_bgr: Optional[np.ndarray] = None
         self._last_paint_ts = 0.0
         self.grabber: Optional[QtCore.QThread] = None
+
+        self._start_modbus_server(self.modbus_host)
 
         self.setWindowTitle(APP_TITLE)
         self.resize(1160, 700)
@@ -1047,6 +1211,112 @@ class MainWindow(QtWidgets.QMainWindow):
             self._toast(f"[YOLO] 推理异常: {exc}")
             return frame_bgr
 
+    def _run_yolo_recognition(self) -> int:
+        if self.last_frame_bgr is None:
+            self._toast("未捕获画面")
+            return 0xFF
+
+        if not self._ensure_yolo_model():
+            return 0xFF
+
+        try:
+            results = self.yolo_model(self.last_frame_bgr, conf=float(self.yolo_conf), verbose=False)
+        except Exception as exc:
+            self._toast(f"[YOLO] 推理异常: {exc}")
+            return 0xFF
+
+        if not results:
+            return 0xFF
+
+        res = results[0]
+        boxes = getattr(res, "boxes", None)
+        if boxes is None:
+            return 0xFF
+
+        names = getattr(res, "names", None) or getattr(self.yolo_model, "names", None) or {}
+        best_score = -1.0
+        best_label: Optional[str] = None
+        best_cls_id: int = -1
+
+        for box in boxes:
+            score = float(box.conf[0]) if box.conf is not None else 0.0
+            if score < float(self.yolo_conf):
+                continue
+
+            cls_id = int(box.cls[0]) if box.cls is not None else -1
+            label = str(cls_id)
+            if isinstance(names, dict) and cls_id in names:
+                label = str(names[cls_id])
+            elif isinstance(names, (list, tuple)) and 0 <= cls_id < len(names):
+                label = str(names[cls_id])
+
+            if score > best_score:
+                best_score = score
+                best_label = label
+                best_cls_id = cls_id
+
+        if best_label is None:
+            return 0xFF
+
+        mapped = self.class_map.get(best_label)
+        if mapped is None and best_cls_id >= 0:
+            mapped = self.class_map.get(str(best_cls_id))
+
+        if mapped is None:
+            print(f"[MODBUS] 未找到类别映射: {best_label}")
+            return 0
+
+        return int(mapped) & 0xFFFF
+
+    # ---------- Modbus ----------
+    def _publish_modbus_result(self, value: int):
+        model = getattr(self, "modbus_model", None)
+        if not model:
+            return
+        model.set_register(RESULT_REGISTER_ADDR, int(value) & 0xFFFF)
+
+    def _handle_recognition_request(self):
+        result_value = self._run_yolo_recognition()
+        self._publish_modbus_result(result_value)
+        if self.modbus_model:
+            self.modbus_model.set_register(TRIGGER_REGISTER_ADDR, 0)
+
+    def _on_modbus_write(self, addr: int, value: int):
+        if addr == TRIGGER_REGISTER_ADDR and value == 1:
+            print("[MODBUS] 收到触发请求")
+            self.modbus_trigger_sig.emit()
+
+    @QtCore.pyqtSlot()
+    def _on_modbus_trigger(self):
+        self._handle_recognition_request()
+
+    def _stop_modbus_server(self):
+        if not getattr(self, "modbus_server", None):
+            return
+        try:
+            self.modbus_server.shutdown()
+        except Exception:
+            pass
+        try:
+            self.modbus_server.server_close()
+        except Exception:
+            pass
+        self.modbus_server = None
+
+    def _start_modbus_server(self, host: Optional[str] = None):
+        if host is not None:
+            self.modbus_host = host
+        self._stop_modbus_server()
+        self.modbus_error = None
+        try:
+            self.modbus_server = start_modbus_server(
+                self.modbus_host, self.modbus_port, self.modbus_model, on_write=self._on_modbus_write
+            )
+        except Exception as exc:
+            print(f"[MODBUS] 启动失败: {exc}")
+            self.modbus_server = None
+            self.modbus_error = str(exc)
+
     def _toast(self, text: str, ms: int = 2200):
         self.status_label.setText(text)
         self.toast_timer.start(ms)
@@ -1135,6 +1405,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._toast(s)
 
     def closeEvent(self, e):
+        self._stop_modbus_server()
         self.stop_camera()
         super().closeEvent(e)
 
