@@ -824,7 +824,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.yolo_enabled = False
         self.yolo_conf = 0.5
         self.yolo_model_path = self.default_model if self.default_model in self.models else DEFAULT_YOLO_MODEL
-        self.yolo_model = None
+        self.slot_model_paths: Dict[int, str] = {1: self.yolo_model_path, 2: self.yolo_model_path}
+        self.yolo_model_cache: Dict[str, YOLO] = {}
         self.yolo_style = 0     # 0~7 不同样式
 
         self.last_frame_bgrs: Dict[int, np.ndarray] = {}
@@ -938,14 +939,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_conf.valueChanged.connect(self._on_yolo_conf_changed)
         yolo_form.addRow("可信度：", self.spin_conf)
 
-        self.combo_model = QtWidgets.QComboBox()
-        for m in self.models:
-            self.combo_model.addItem(os.path.basename(m), m)
-        idx_model = self.combo_model.findData(self.yolo_model_path)
-        if idx_model >= 0:
-            self.combo_model.setCurrentIndex(idx_model)
-        self.combo_model.currentIndexChanged.connect(self._on_yolo_model_changed)
-        yolo_form.addRow("模型：", self.combo_model)
+        self.combo_model1 = QtWidgets.QComboBox()
+        self.combo_model2 = QtWidgets.QComboBox()
+        for combo in (self.combo_model1, self.combo_model2):
+            for m in self.models:
+                combo.addItem(os.path.basename(m), m)
+
+        idx_model1 = self.combo_model1.findData(self.slot_model_paths.get(1, self.yolo_model_path))
+        if idx_model1 >= 0:
+            self.combo_model1.setCurrentIndex(idx_model1)
+        idx_model2 = self.combo_model2.findData(self.slot_model_paths.get(2, self.yolo_model_path))
+        if idx_model2 >= 0:
+            self.combo_model2.setCurrentIndex(idx_model2)
+
+        self.combo_model1.currentIndexChanged.connect(lambda i: self._on_yolo_model_changed(1, i))
+        self.combo_model2.currentIndexChanged.connect(lambda i: self._on_yolo_model_changed(2, i))
+        yolo_form.addRow("模型1：", self.combo_model1)
+        yolo_form.addRow("模型2：", self.combo_model2)
 
         self.combo_style = QtWidgets.QComboBox()
         self.combo_style.addItem("经典绿色框", 0)
@@ -983,16 +993,26 @@ class MainWindow(QtWidgets.QMainWindow):
         right_lay.setContentsMargins(8, 8, 8, 8)
         right_lay.setSpacing(8)
 
-        header_grid = QtWidgets.QGridLayout()
+        header_row = QtWidgets.QHBoxLayout()
         self.lbl_cam1 = QtWidgets.QLabel("摄像头1: —")
         self.lbl_fps1 = QtWidgets.QLabel("FPS1: —")
         self.lbl_cam2 = QtWidgets.QLabel("摄像头2: —")
         self.lbl_fps2 = QtWidgets.QLabel("FPS2: —")
-        header_grid.addWidget(self.lbl_cam1, 0, 0)
-        header_grid.addWidget(self.lbl_fps1, 0, 1, QtCore.Qt.AlignRight)
-        header_grid.addWidget(self.lbl_cam2, 1, 0)
-        header_grid.addWidget(self.lbl_fps2, 1, 1, QtCore.Qt.AlignRight)
-        right_lay.addLayout(header_grid)
+
+        cam1_row = QtWidgets.QHBoxLayout()
+        cam1_row.addWidget(self.lbl_cam1)
+        cam1_row.addStretch(1)
+        cam1_row.addWidget(self.lbl_fps1)
+
+        cam2_row = QtWidgets.QHBoxLayout()
+        cam2_row.addWidget(self.lbl_cam2)
+        cam2_row.addStretch(1)
+        cam2_row.addWidget(self.lbl_fps2)
+
+        header_row.addLayout(cam1_row, 1)
+        header_row.addSpacing(12)
+        header_row.addLayout(cam2_row, 1)
+        right_lay.addLayout(header_row)
 
         video_row = QtWidgets.QHBoxLayout()
         self.video_lbl1 = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
@@ -1053,6 +1073,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.lbl_cam2.setVisible(has_cam2)
         if getattr(self.lbl_fps2, "setVisible", None):
             self.lbl_fps2.setVisible(has_cam2)
+        if getattr(self, "combo_model2", None) is not None:
+            self.combo_model2.setEnabled(has_cam2 and bool(self.models))
         if not has_cam2:
             lbl2 = self._video_label_for(2)
             if lbl2:
@@ -1184,24 +1206,38 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_yolo_conf_changed(self, value: float):
         self.yolo_conf = max(0.0, min(1.0, float(value)))
 
-    def _on_yolo_model_changed(self, index: int):
+    def _on_yolo_model_changed(self, cam_index: int, index: int):
         if index < 0:
             return
-        data = self.combo_model.itemData(index)
-        model_path = str(data or self.combo_model.currentText() or "").strip()
+
+        combo = self.combo_model1 if cam_index == 1 else self.combo_model2
+        data = combo.itemData(index)
+        model_path = str(data or combo.currentText() or "").strip()
         if not model_path:
             return
-        if model_path != self.yolo_model_path:
-            self.yolo_model_path = model_path
-            self.yolo_model = None
+
+        if self.slot_model_paths.get(cam_index) != model_path:
+            self.slot_model_paths[cam_index] = model_path
+            # 清除旧缓存，按需重新加载
+            norm_path = self._normalized_model_path(model_path)
+            if norm_path in self.yolo_model_cache:
+                self.yolo_model_cache.pop(norm_path, None)
             if self.yolo_enabled:
-                self._ensure_yolo_model()
+                self._ensure_yolo_model(model_path)
 
     def _on_yolo_style_changed(self, index: int):
         data = self.combo_style.itemData(index)
         self.yolo_style = int(data) if data is not None else int(index)
 
-    def _ensure_yolo_model(self) -> bool:
+    def _normalized_model_path(self, model_path: str) -> str:
+        candidate = model_path
+        if not os.path.isabs(candidate):
+            res = resource_path(candidate)
+            if os.path.exists(res):
+                candidate = res
+        return candidate
+
+    def _ensure_yolo_model(self, model_path: Optional[str] = None) -> bool:
         if not YOLO_AVAILABLE:
             self._toast(f"[YOLO] 未安装 ultralytics 库: {YOLO_IMPORT_ERROR}")
             if hasattr(self, "chk_yolo"):
@@ -1209,24 +1245,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self.yolo_enabled = False
             return False
 
-        if self.yolo_model is not None:
+        path = self._normalized_model_path(model_path or self.yolo_model_path or DEFAULT_YOLO_MODEL)
+
+        if path in self.yolo_model_cache:
             return True
 
-        model_path = self.yolo_model_path or DEFAULT_YOLO_MODEL
-        if not os.path.isabs(model_path):
-            model_path = resource_path(model_path)
-
-        if not os.path.exists(model_path):
-            self._toast(f"[YOLO] 模型文件不存在: {model_path}")
+        if not os.path.exists(path):
+            self._toast(f"[YOLO] 模型文件不存在: {path}")
             if hasattr(self, "chk_yolo"):
                 self.chk_yolo.setChecked(False)
             self.yolo_enabled = False
             return False
 
         try:
-            self.yolo_model = YOLO(model_path)
-            self.yolo_model_path = model_path
-            self._toast(f"[YOLO] 模型已加载: {os.path.basename(model_path)}", ms=2000)
+            self.yolo_model_cache[path] = YOLO(path)
+            self.yolo_model_path = path
+            self._toast(f"[YOLO] 模型已加载: {os.path.basename(path)}", ms=2000)
             return True
         except Exception as exc:
             self._toast(f"[YOLO] 加载模型失败: {exc}")
@@ -1235,15 +1269,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self.yolo_enabled = False
             return False
 
-    def _apply_yolo(self, frame_bgr: np.ndarray) -> np.ndarray:
+    def _model_for_cam(self, cam_index: int) -> Optional[YOLO]:
+        model_path = self.slot_model_paths.get(cam_index) or self.yolo_model_path or DEFAULT_YOLO_MODEL
+        norm_path = self._normalized_model_path(model_path)
+        if norm_path not in self.yolo_model_cache:
+            if not self._ensure_yolo_model(norm_path):
+                return None
+        return self.yolo_model_cache.get(norm_path)
+
+    def _apply_yolo(self, cam_index: int, frame_bgr: np.ndarray) -> np.ndarray:
         """在 BGR 图像上做 YOLO 推理并画框，只显示高于当前阈值的目标。
         同时根据分辨率自动调整字体大小和线宽。
         """
-        if self.yolo_model is None:
+        model = self._model_for_cam(cam_index)
+        if model is None:
             return frame_bgr
 
         try:
-            results = self.yolo_model(frame_bgr, conf=float(self.yolo_conf), verbose=False)
+            results = model(frame_bgr, conf=float(self.yolo_conf), verbose=False)
             if not results:
                 return frame_bgr
 
@@ -1253,7 +1296,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return frame_bgr
 
             overlay = frame_bgr.copy()
-            names = getattr(res, "names", None) or getattr(self.yolo_model, "names", None) or {}
+            names = getattr(res, "names", None) or getattr(model, "names", None) or {}
 
             style = int(getattr(self, "yolo_style", 0))
             font = cv2.FONT_HERSHEY_SIMPLEX
@@ -1504,11 +1547,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self._toast(f"摄像头{cam_index} 未捕获画面")
             return 0xFF
 
-        if not self._ensure_yolo_model():
+        model = self._model_for_cam(cam_index)
+        if model is None:
             return 0xFF
 
         try:
-            results = self.yolo_model(frame, conf=float(self.yolo_conf), verbose=False)
+            results = model(frame, conf=float(self.yolo_conf), verbose=False)
         except Exception as exc:
             self._toast(f"[YOLO] 推理异常: {exc}")
             return 0xFF
@@ -1521,7 +1565,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if boxes is None:
             return 0xFF
 
-        names = getattr(res, "names", None) or getattr(self.yolo_model, "names", None) or {}
+        names = getattr(res, "names", None) or getattr(model, "names", None) or {}
         best_score = -1.0
         best_label: Optional[str] = None
         best_cls_id: int = -1
@@ -1749,8 +1793,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if getattr(self, "chk_yolo", None) is not None and self.chk_yolo.isChecked():
             self.yolo_enabled = True
-            if self._ensure_yolo_model():
-                frame_to_show = self._apply_yolo(frame_bgr)
+            target_model = self.slot_model_paths.get(cam_index, self.yolo_model_path)
+            if self._ensure_yolo_model(target_model):
+                frame_to_show = self._apply_yolo(cam_index, frame_bgr)
         else:
             self.yolo_enabled = False
 
