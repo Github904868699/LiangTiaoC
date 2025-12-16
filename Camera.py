@@ -843,8 +843,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.yolo_style = 0     # 0~7 不同样式
 
         self.last_frame_bgrs: Dict[int, np.ndarray] = {}
-        self.last_frame_bgr: Optional[np.ndarray] = None
         self._last_paint_ts: Dict[int, float] = {}
+        self._last_frame_ts: Dict[int, float] = {1: 0.0, 2: 0.0}
+        self._last_restart_ts: Dict[int, float] = {1: 0.0, 2: 0.0}
         self.grabbers: Dict[int, QtCore.QThread] = {}
 
         self._start_modbus_server(self.modbus_host)
@@ -1063,6 +1064,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.modbus_ui_timer.timeout.connect(self._refresh_modbus_status)
         self.modbus_ui_timer.start()
         self._refresh_modbus_status()
+
+        self.watchdog_timer = QtCore.QTimer(self)
+        self.watchdog_timer.setInterval(3000)
+        self.watchdog_timer.timeout.connect(self._watchdog_tick)
+        self.watchdog_timer.start()
 
         self._refresh_hik_devices()
         self._refresh_usb_indices()
@@ -1758,6 +1764,7 @@ class MainWindow(QtWidgets.QMainWindow):
         grabber.start()
         if slot not in self.active_slots:
             self.active_slots.append(slot)
+        self._last_frame_ts[slot] = time.time()
 
     @QtCore.pyqtSlot(str)
     def _on_grabber_error(self, message: str):
@@ -1782,6 +1789,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.active_slots.remove(slot)
             except ValueError:
                 pass
+        self._last_frame_ts[slot] = 0.0
 
     def stop_camera(self, slot: Optional[int] = None):
         if slot is None:
@@ -1799,13 +1807,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if (t - last_ts) < (1.0 / UI_PAINT_FPS):
             return
         self._last_paint_ts[cam_index] = t
+        self._last_frame_ts[cam_index] = t
 
         if frame_bgr is None or frame_bgr.size == 0:
             return
 
         self.last_frame_bgrs[cam_index] = frame_bgr
-        if cam_index == 1:
-            self.last_frame_bgr = frame_bgr
 
         frame_to_show = frame_bgr
 
@@ -1842,6 +1849,30 @@ class MainWindow(QtWidgets.QMainWindow):
             fps_label.setText(f"FPS{cam_index}: " + s.replace("[FPS]", "").strip())
         elif s.startswith("[HIK]") or s.startswith("[USB]"):
             self._toast(s)
+
+    def _watchdog_tick(self):
+        now = time.time()
+        for slot in (1, 2):
+            if slot not in self.active_slots:
+                continue
+
+            grabber = self.grabbers.get(slot)
+            alive = bool(grabber and getattr(grabber, "isRunning", lambda: False)())
+            last_frame_ts = self._last_frame_ts.get(slot, 0.0)
+            stalled = (now - last_frame_ts) > 8.0 if last_frame_ts > 0 else False
+
+            if alive and not stalled:
+                continue
+
+            last_restart = self._last_restart_ts.get(slot, 0.0)
+            if (now - last_restart) < 5.0:
+                continue
+
+            reason = "线程已退出" if not alive else "长时间无画面，自动重启"
+            self._toast(f"摄像头{slot}: {reason}")
+            self._last_restart_ts[slot] = now
+            self._stop_slot(slot)
+            QtCore.QTimer.singleShot(200, lambda s=slot: self._start_slot(s))
 
     def closeEvent(self, e):
         self._stop_modbus_server()
