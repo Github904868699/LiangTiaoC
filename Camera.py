@@ -141,12 +141,27 @@ def load_config(path: str = CONFIG_PATH) -> Dict:
         cfg = {
             "server": {"host": "0.0.0.0", "port": 502},
             "class_map": {},
-            "models": [DEFAULT_YOLO_MODEL],
         }
     cfg.setdefault("server", {"host": "0.0.0.0", "port": 502})
     cfg.setdefault("class_map", {})
-    cfg.setdefault("models", [DEFAULT_YOLO_MODEL])
     return cfg
+
+
+def list_pt_models(base_dir: Optional[str] = None) -> List[str]:
+    try:
+        root = Path(base_dir) if base_dir else Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    except Exception:
+        root = Path(__file__).parent
+
+    models = []
+    try:
+        for p in sorted(root.glob("*.pt")):
+            if p.is_file():
+                models.append(str(p))
+    except Exception:
+        pass
+
+    return models or [DEFAULT_YOLO_MODEL]
 
 
 def get_local_ip() -> str:
@@ -803,7 +818,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.config = load_config(CONFIG_PATH)
         server_cfg = self.config.get("server", {})
         self.class_map: Dict[str, int] = {k: int(v) for k, v in self.config.get("class_map", {}).items()}
-        self.models: List[str] = list(dict.fromkeys(self.config.get("models", []) or [DEFAULT_YOLO_MODEL]))
+        self.models: List[str] = list_pt_models()
         self.default_model: str = self.models[0] if self.models else DEFAULT_YOLO_MODEL
         self.modbus_host = str(server_cfg.get("host", "0.0.0.0") or "0.0.0.0")
         self.modbus_port = int(server_cfg.get("port", 502))
@@ -812,19 +827,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.modbus_error: Optional[str] = None
         self.modbus_trigger_sig.connect(self._on_modbus_trigger)
 
-        # 默认摄像头配置
-        self.source = "hik"   # "hik" / "usb"
-        self.hik_index = 0
-        self.usb_index = 0
+        # 默认摄像头配置（双路独立）
+        self.slot_sources: Dict[int, str] = {1: "hik", 2: "hik"}
+        self.hik_indices: Dict[int, int] = {1: 0, 2: 1}
+        self.usb_indices_selected: Dict[int, int] = {1: 0, 2: 1}
         self.usb_indices: List[int] = []
         self.hik_devices: List[tuple] = []
         self.active_slots: List[int] = []
 
-        # 默认 YOLO 配置
-        self.yolo_enabled = False
+        # 默认 YOLO 配置（双路独立启用与模型）
         self.yolo_conf = 0.5
-        self.yolo_model_path = self.default_model if self.default_model in self.models else DEFAULT_YOLO_MODEL
-        self.slot_model_paths: Dict[int, str] = {1: self.yolo_model_path, 2: self.yolo_model_path}
+        self.slot_yolo_enabled: Dict[int, bool] = {1: False, 2: False}
+        self.slot_model_paths: Dict[int, str] = {1: self.default_model, 2: self.default_model}
         self.yolo_model_cache: Dict[str, YOLO] = {}
         self.yolo_style = 0     # 0~7 不同样式
 
@@ -857,79 +871,98 @@ class MainWindow(QtWidgets.QMainWindow):
         left_lay.setContentsMargins(8, 8, 8, 8)
         left_lay.setSpacing(10)
 
-        # 摄像头分组
-        gb_src = QtWidgets.QGroupBox("摄像头")
-        left_lay.addWidget(gb_src)
-        form = QtWidgets.QFormLayout(gb_src)
-        form.setContentsMargins(10, 10, 10, 10)
-        form.setSpacing(8)
+        self.slot_widgets: Dict[int, Dict[str, QtWidgets.QWidget]] = {}
 
-        self.source_combo = QtWidgets.QComboBox()
-        self.source_combo.addItem("海康网络相机", "hik")
-        self.source_combo.addItem("USB", "usb")
-        idx = self.source_combo.findData(self.source)
-        if idx >= 0:
-            self.source_combo.setCurrentIndex(idx)
-        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
-        form.addRow("摄像头：", self.source_combo)
+        for slot in (1, 2):
+            gb_slot = QtWidgets.QGroupBox(f"摄像头{slot}")
+            left_lay.addWidget(gb_slot)
+            form = QtWidgets.QFormLayout(gb_slot)
+            form.setContentsMargins(10, 10, 10, 10)
+            form.setSpacing(8)
 
-        hik_row = QtWidgets.QHBoxLayout()
-        self.hik_index_combo = QtWidgets.QComboBox()
-        self.btn_hik_refresh = QtWidgets.QPushButton("刷新")
-        self.btn_hik_refresh.setFixedWidth(70)
-        self.btn_hik_refresh.clicked.connect(self._refresh_hik_devices)
-        hik_row.addWidget(self.hik_index_combo, 1)
-        hik_row.addWidget(self.btn_hik_refresh, 0)
-        hik_wrap = QtWidgets.QWidget()
-        hik_wrap.setLayout(hik_row)
+            source_combo = QtWidgets.QComboBox()
+            source_combo.addItem("海康网络相机", "hik")
+            source_combo.addItem("USB", "usb")
+            idx = source_combo.findData(self.slot_sources.get(slot, "hik"))
+            if idx >= 0:
+                source_combo.setCurrentIndex(idx)
+            source_combo.currentIndexChanged.connect(lambda i, s=slot: self._on_slot_source_changed(s, i))
+            form.addRow("类型：", source_combo)
 
-        usb_row = QtWidgets.QHBoxLayout()
-        self.usb_index_combo = QtWidgets.QComboBox()
-        self.btn_usb_refresh = QtWidgets.QPushButton("刷新")
-        self.btn_usb_refresh.setFixedWidth(70)
-        self.btn_usb_refresh.clicked.connect(self._refresh_usb_indices)
-        usb_row.addWidget(self.usb_index_combo, 1)
-        usb_row.addWidget(self.btn_usb_refresh, 0)
-        usb_wrap = QtWidgets.QWidget()
-        usb_wrap.setLayout(usb_row)
+            hik_row = QtWidgets.QHBoxLayout()
+            hik_combo = QtWidgets.QComboBox()
+            btn_hik_refresh = QtWidgets.QPushButton("刷新")
+            btn_hik_refresh.setFixedWidth(70)
+            btn_hik_refresh.clicked.connect(self._refresh_hik_devices)
+            hik_row.addWidget(hik_combo, 1)
+            hik_row.addWidget(btn_hik_refresh, 0)
+            hik_wrap = QtWidgets.QWidget()
+            hik_wrap.setLayout(hik_row)
 
-        self.idx_stack = QtWidgets.QStackedWidget()
-        self.idx_stack.setContentsMargins(0, 0, 0, 0)
-        self.idx_stack.addWidget(hik_wrap)
-        self.idx_stack.addWidget(usb_wrap)
+            usb_row = QtWidgets.QHBoxLayout()
+            usb_combo = QtWidgets.QComboBox()
+            btn_usb_refresh = QtWidgets.QPushButton("刷新")
+            btn_usb_refresh.setFixedWidth(70)
+            btn_usb_refresh.clicked.connect(self._refresh_usb_indices)
+            usb_row.addWidget(usb_combo, 1)
+            usb_row.addWidget(btn_usb_refresh, 0)
+            usb_wrap = QtWidgets.QWidget()
+            usb_wrap.setLayout(usb_row)
 
-        self.hik_index_wrap = hik_wrap
-        self.usb_index_wrap = usb_wrap
-        form.addRow("索引：", self.idx_stack)
+            idx_stack = QtWidgets.QStackedWidget()
+            idx_stack.setContentsMargins(0, 0, 0, 0)
+            idx_stack.addWidget(hik_wrap)
+            idx_stack.addWidget(usb_wrap)
+            form.addRow("索引：", idx_stack)
 
-        # 控制分组
-        gb_ctrl = QtWidgets.QGroupBox("控制")
-        left_lay.addWidget(gb_ctrl)
-        ctrl_lay = QtWidgets.QHBoxLayout(gb_ctrl)
-        ctrl_lay.setContentsMargins(10, 10, 10, 10)
-        ctrl_lay.setSpacing(8)
+            ctrl_row = QtWidgets.QHBoxLayout()
+            btn_reopen = QtWidgets.QPushButton("重连")
+            btn_stop = QtWidgets.QPushButton("停止")
+            btn_auto_adjust = QtWidgets.QPushButton("一键自动调节")
+            btn_reopen.clicked.connect(lambda _=None, s=slot: self.reopen_camera(s))
+            btn_stop.clicked.connect(lambda _=None, s=slot: self.stop_camera(s))
+            btn_auto_adjust.clicked.connect(lambda _=None, s=slot: self._on_auto_adjust_clicked(s))
+            ctrl_row.addWidget(btn_reopen, 1)
+            ctrl_row.addWidget(btn_stop, 1)
+            ctrl_row.addWidget(btn_auto_adjust, 1)
+            ctrl_wrap = QtWidgets.QWidget()
+            ctrl_wrap.setLayout(ctrl_row)
+            form.addRow("控制：", ctrl_wrap)
 
-        self.btn_reopen = QtWidgets.QPushButton("重连")
-        self.btn_stop = QtWidgets.QPushButton("停止")
-        self.btn_auto_adjust = QtWidgets.QPushButton("一键自动调节")
-        self.btn_reopen.clicked.connect(self.reopen_camera)
-        self.btn_stop.clicked.connect(self.stop_camera)
-        self.btn_auto_adjust.clicked.connect(self._on_auto_adjust_clicked)
-        ctrl_lay.addWidget(self.btn_reopen, 1)
-        ctrl_lay.addWidget(self.btn_stop, 1)
-        ctrl_lay.addWidget(self.btn_auto_adjust, 1)
+            chk_yolo = QtWidgets.QCheckBox("启用 YOLO")
+            chk_yolo.setChecked(self.slot_yolo_enabled.get(slot, False))
+            chk_yolo.stateChanged.connect(lambda state, s=slot: self._on_yolo_enabled_changed(s, state))
+            form.addRow("YOLO：", chk_yolo)
 
-        # YOLO 分组
-        gb_yolo = QtWidgets.QGroupBox("YOLO")
+            combo_model = QtWidgets.QComboBox()
+            for m in self.models:
+                combo_model.addItem(os.path.basename(m), m)
+            idx_model = combo_model.findData(self.slot_model_paths.get(slot, self.default_model))
+            if idx_model >= 0:
+                combo_model.setCurrentIndex(idx_model)
+            combo_model.currentIndexChanged.connect(lambda i, s=slot: self._on_yolo_model_changed(s, i))
+            form.addRow("模型：", combo_model)
+
+            self.slot_widgets[slot] = {
+                "source": source_combo,
+                "hik_combo": hik_combo,
+                "usb_combo": usb_combo,
+                "hik_refresh": btn_hik_refresh,
+                "usb_refresh": btn_usb_refresh,
+                "idx_stack": idx_stack,
+                "btn_reopen": btn_reopen,
+                "btn_stop": btn_stop,
+                "btn_auto": btn_auto_adjust,
+                "chk_yolo": chk_yolo,
+                "combo_model": combo_model,
+            }
+
+        # YOLO 全局设置
+        gb_yolo = QtWidgets.QGroupBox("YOLO 设置")
         left_lay.addWidget(gb_yolo)
         yolo_form = QtWidgets.QFormLayout(gb_yolo)
         yolo_form.setContentsMargins(10, 10, 10, 10)
         yolo_form.setSpacing(8)
-
-        self.chk_yolo = QtWidgets.QCheckBox("启用 YOLO 识别")
-        self.chk_yolo.setChecked(self.yolo_enabled)
-        self.chk_yolo.stateChanged.connect(self._on_yolo_enabled_changed)
-        yolo_form.addRow("开关：", self.chk_yolo)
 
         self.spin_conf = QtWidgets.QDoubleSpinBox()
         self.spin_conf.setDecimals(2)
@@ -938,24 +971,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_conf.setValue(self.yolo_conf)
         self.spin_conf.valueChanged.connect(self._on_yolo_conf_changed)
         yolo_form.addRow("可信度：", self.spin_conf)
-
-        self.combo_model1 = QtWidgets.QComboBox()
-        self.combo_model2 = QtWidgets.QComboBox()
-        for combo in (self.combo_model1, self.combo_model2):
-            for m in self.models:
-                combo.addItem(os.path.basename(m), m)
-
-        idx_model1 = self.combo_model1.findData(self.slot_model_paths.get(1, self.yolo_model_path))
-        if idx_model1 >= 0:
-            self.combo_model1.setCurrentIndex(idx_model1)
-        idx_model2 = self.combo_model2.findData(self.slot_model_paths.get(2, self.yolo_model_path))
-        if idx_model2 >= 0:
-            self.combo_model2.setCurrentIndex(idx_model2)
-
-        self.combo_model1.currentIndexChanged.connect(lambda i: self._on_yolo_model_changed(1, i))
-        self.combo_model2.currentIndexChanged.connect(lambda i: self._on_yolo_model_changed(2, i))
-        yolo_form.addRow("模型1：", self.combo_model1)
-        yolo_form.addRow("模型2：", self.combo_model2)
 
         self.combo_style = QtWidgets.QComboBox()
         self.combo_style.addItem("经典绿色框", 0)
@@ -1051,7 +1066,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._refresh_hik_devices()
         self._refresh_usb_indices()
-        self._update_usb_controls_enabled()
+        self._update_all_slot_controls()
         self._start_camera()
 
         splitter.setStretchFactor(0, 0)
@@ -1059,27 +1074,57 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter.setSizes([300, 860])
 
     # ---------- UI 逻辑 ----------
-    def _current_source(self) -> str:
-        return str(self.source_combo.currentData() or "hik")
-
     def _video_label_for(self, cam_index: int) -> Optional[QtWidgets.QLabel]:
         return self.video_lbl1 if cam_index == 1 else self.video_lbl2 if cam_index == 2 else None
 
+    def _slot_source(self, slot: int) -> str:
+        widget = self.slot_widgets.get(slot, {}).get("source")
+        if widget is None:
+            return "hik"
+        return str(widget.currentData() or "hik")
+
+    def _update_slot_stack(self, slot: int):
+        widgets = self.slot_widgets.get(slot, {})
+        idx_stack: QtWidgets.QStackedWidget = widgets.get("idx_stack")  # type: ignore
+        if idx_stack is None:
+            return
+        is_usb = self._slot_source(slot) == "usb"
+        target = idx_stack.widget(1 if is_usb else 0)
+        if target:
+            idx_stack.setCurrentWidget(target)
+
+    def _update_slot_controls(self, slot: int):
+        widgets = self.slot_widgets.get(slot, {})
+        is_hik = self._slot_source(slot) == "hik"
+        self._update_slot_stack(slot)
+
+        hik_combo: QtWidgets.QComboBox = widgets.get("hik_combo")  # type: ignore
+        usb_combo: QtWidgets.QComboBox = widgets.get("usb_combo")  # type: ignore
+        btn_hik_refresh: QtWidgets.QPushButton = widgets.get("hik_refresh")  # type: ignore
+        btn_usb_refresh: QtWidgets.QPushButton = widgets.get("usb_refresh")  # type: ignore
+        btn_auto: QtWidgets.QPushButton = widgets.get("btn_auto")  # type: ignore
+
+        if hik_combo:
+            hik_combo.setEnabled(is_hik and len(self.hik_devices) > 1)
+        if usb_combo:
+            usb_combo.setEnabled((not is_hik) and len(self.usb_indices) > 1)
+        if btn_hik_refresh:
+            btn_hik_refresh.setEnabled(True)
+        if btn_usb_refresh:
+            btn_usb_refresh.setEnabled(True)
+        if btn_auto:
+            btn_auto.setEnabled(is_hik)
+
+    def _update_all_slot_controls(self):
+        for slot in (1, 2):
+            self._update_slot_controls(slot)
+
     def _update_video_visibility(self):
-        has_cam2 = 2 in self.active_slots
-        if getattr(self.video_lbl2, "setVisible", None):
-            self.video_lbl2.setVisible(has_cam2)
-        if getattr(self.lbl_cam2, "setVisible", None):
-            self.lbl_cam2.setVisible(has_cam2)
-        if getattr(self.lbl_fps2, "setVisible", None):
-            self.lbl_fps2.setVisible(has_cam2)
-        if getattr(self, "combo_model2", None) is not None:
-            self.combo_model2.setEnabled(has_cam2 and bool(self.models))
-        if not has_cam2:
-            lbl2 = self._video_label_for(2)
-            if lbl2:
-                lbl2.clear()
-                lbl2.setText("无信号")
+        for slot in (1, 2):
+            lbl = self._video_label_for(slot)
+            if slot not in self.active_slots and lbl:
+                lbl.clear()
+                lbl.setText("无信号")
 
     def _refresh_hik_devices(self):
         try:
@@ -1088,120 +1133,106 @@ class MainWindow(QtWidgets.QMainWindow):
             devices = []
             self._toast(f"海康枚举失败: {exc}")
         self.hik_devices = devices
-        blocker = QtCore.QSignalBlocker(self.hik_index_combo)
-        self.hik_index_combo.clear()
-        for idx, _info in enumerate(self.hik_devices):
-            self.hik_index_combo.addItem(f"摄像头{idx + 1}", idx)
-        if self.hik_devices:
-            idx = self.hik_index_combo.findData(int(self.hik_index))
-            if idx < 0:
-                idx = 0
-                self.hik_index = int(self.hik_index_combo.itemData(0) or 0)
-            self.hik_index_combo.setCurrentIndex(idx)
-        del blocker
 
-        try:
-            self.hik_index_combo.currentIndexChanged.disconnect()
-        except Exception:
-            pass
-        self.hik_index_combo.currentIndexChanged.connect(self._on_hik_index_changed)
+        for slot in (1, 2):
+            combo: QtWidgets.QComboBox = self.slot_widgets.get(slot, {}).get("hik_combo")  # type: ignore
+            if combo is None:
+                continue
+            blocker = QtCore.QSignalBlocker(combo)
+            combo.clear()
+            for idx, _info in enumerate(self.hik_devices):
+                combo.addItem(f"摄像头{idx + 1}", idx)
+            if self.hik_devices and combo.count() > 0:
+                desired = self.hik_indices.get(slot, 0)
+                idx = combo.findData(int(desired))
+                if idx < 0:
+                    idx = 0
+                combo.setCurrentIndex(idx)
+                self.hik_indices[slot] = int(combo.itemData(idx) or 0)
+            del blocker
+            try:
+                combo.currentIndexChanged.disconnect()
+            except Exception:
+                pass
+            combo.currentIndexChanged.connect(lambda i, s=slot: self._on_hik_index_changed(s, i))
 
-        self._update_index_controls()
+        self._update_all_slot_controls()
 
     def _refresh_usb_indices(self):
         indices = scan_usb_indices(max_index=10)
         self.usb_indices = list(indices)
-        blocker = QtCore.QSignalBlocker(self.usb_index_combo)
-        self.usb_index_combo.clear()
-        for i in indices:
-            self.usb_index_combo.addItem(str(i), int(i))
-        idx = self.usb_index_combo.findData(int(self.usb_index))
-        if idx < 0:
-            idx = 0
-            self.usb_index = int(self.usb_index_combo.itemData(0) or 0)
-        self.usb_index_combo.setCurrentIndex(idx)
-        del blocker
+        for slot in (1, 2):
+            combo: QtWidgets.QComboBox = self.slot_widgets.get(slot, {}).get("usb_combo")  # type: ignore
+            if combo is None:
+                continue
+            blocker = QtCore.QSignalBlocker(combo)
+            combo.clear()
+            for i in indices:
+                combo.addItem(str(i), int(i))
+            if combo.count() > 0:
+                desired = self.usb_indices_selected.get(slot, 0)
+                idx = combo.findData(int(desired))
+                if idx < 0:
+                    idx = 0
+                combo.setCurrentIndex(idx)
+                self.usb_indices_selected[slot] = int(combo.itemData(idx) or 0)
+            del blocker
+            try:
+                combo.currentIndexChanged.disconnect()
+            except Exception:
+                pass
+            combo.currentIndexChanged.connect(lambda i, s=slot: self._on_usb_index_changed(s, i))
 
-        try:
-            self.usb_index_combo.currentIndexChanged.disconnect()
-        except Exception:
-            pass
-        self.usb_index_combo.currentIndexChanged.connect(self._on_usb_index_changed)
+        self._update_all_slot_controls()
 
-    def _update_usb_controls_enabled(self):
-        is_usb = (self._current_source() == "usb")
-        self.usb_index_combo.setEnabled(is_usb)
-        self.btn_usb_refresh.setEnabled(is_usb)
-        self._update_index_controls()
-        self._update_control_buttons_enabled()
+    def _on_slot_source_changed(self, slot: int, _index: int):
+        self.slot_sources[slot] = self._slot_source(slot)
+        self._update_slot_controls(slot)
+        self._start_slot(slot)
 
-    def _update_index_controls(self):
-        is_usb = (self._current_source() == "usb")
-        if getattr(self, "idx_stack", None) is not None:
-            target = self.usb_index_wrap if is_usb else self.hik_index_wrap
-            self.idx_stack.setCurrentWidget(target)
-
-        is_hik = (self._current_source() == "hik")
-        if getattr(self, "hik_index_combo", None) is not None:
-            device_count = len(self.hik_devices)
-            enable_combo = device_count > 1 and is_hik
-            self.hik_index_combo.setEnabled(enable_combo)
-            self.btn_hik_refresh.setEnabled(is_hik)
-            if device_count == 0:
-                self.hik_index_combo.clear()
-
-        if getattr(self, "usb_index_combo", None) is not None:
-            usb_count = len(self.usb_indices)
-            enable_usb = usb_count > 1 and is_usb
-            self.usb_index_combo.setEnabled(enable_usb)
-            self.btn_usb_refresh.setEnabled(is_usb)
-
-    def _update_control_buttons_enabled(self):
-        is_hik = (self._current_source() == "hik")
-        if getattr(self, "btn_auto_adjust", None) is not None:
-            self.btn_auto_adjust.setEnabled(is_hik)
-
-    def _on_source_changed(self, _index: int):
-        self.source = self._current_source()
-        self._update_usb_controls_enabled()
-        self._update_control_buttons_enabled()
-        self._start_camera()
-
-    def _on_usb_index_changed(self, index: int):
+    def _on_usb_index_changed(self, slot: int, index: int):
         if index < 0:
             return
-        data = self.usb_index_combo.itemData(index)
+        combo: QtWidgets.QComboBox = self.slot_widgets.get(slot, {}).get("usb_combo")  # type: ignore
+        if combo is None:
+            return
+        data = combo.itemData(index)
         if data is None:
             return
-        self.usb_index = int(data)
-        if self._current_source() == "usb":
-            self._start_camera()
+        self.usb_indices_selected[slot] = int(data)
+        if self._slot_source(slot) == "usb":
+            self._start_slot(slot)
 
-    def _on_hik_index_changed(self, index: int):
+    def _on_hik_index_changed(self, slot: int, index: int):
         if index < 0:
             return
-        data = self.hik_index_combo.itemData(index)
+        combo: QtWidgets.QComboBox = self.slot_widgets.get(slot, {}).get("hik_combo")  # type: ignore
+        if combo is None:
+            return
+        data = combo.itemData(index)
         if data is None:
             return
-        self.hik_index = int(data)
+        self.hik_indices[slot] = int(data)
+        if self._slot_source(slot) == "hik":
+            self._start_slot(slot)
 
-    def _on_auto_adjust_clicked(self):
+    def _on_auto_adjust_clicked(self, slot: int):
         target = None
-        for g in self.grabbers.values():
-            if isinstance(g, HikGrabber):
-                target = g
-                break
+        grabber = self.grabbers.get(slot)
+        if grabber and isinstance(grabber, HikGrabber):
+            target = grabber
         if target is None:
-            self._toast("当前非海康相机，无法自动调节")
+            self._toast(f"摄像头{slot} 当前非海康相机，无法自动调节")
             return
         target.autoAdjustSignal.emit()
-        self._toast("正在自动调节...")
+        self._toast(f"摄像头{slot} 正在自动调节...")
 
     # ---------- YOLO 控制 ----------
-    def _on_yolo_enabled_changed(self, state: int):
-        self.yolo_enabled = (state == QtCore.Qt.Checked)
-        if self.yolo_enabled:
-            self._ensure_yolo_model()
+    def _on_yolo_enabled_changed(self, slot: int, state: int):
+        enabled = (state == QtCore.Qt.Checked)
+        self.slot_yolo_enabled[slot] = enabled
+        if enabled:
+            self._ensure_yolo_model(self.slot_model_paths.get(slot))
 
     def _on_yolo_conf_changed(self, value: float):
         self.yolo_conf = max(0.0, min(1.0, float(value)))
@@ -1210,7 +1241,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if index < 0:
             return
 
-        combo = self.combo_model1 if cam_index == 1 else self.combo_model2
+        combo: QtWidgets.QComboBox = self.slot_widgets.get(cam_index, {}).get("combo_model")  # type: ignore
+        if combo is None:
+            return
         data = combo.itemData(index)
         model_path = str(data or combo.currentText() or "").strip()
         if not model_path:
@@ -1222,7 +1255,7 @@ class MainWindow(QtWidgets.QMainWindow):
             norm_path = self._normalized_model_path(model_path)
             if norm_path in self.yolo_model_cache:
                 self.yolo_model_cache.pop(norm_path, None)
-            if self.yolo_enabled:
+            if self.slot_yolo_enabled.get(cam_index):
                 self._ensure_yolo_model(model_path)
 
     def _on_yolo_style_changed(self, index: int):
@@ -1240,37 +1273,27 @@ class MainWindow(QtWidgets.QMainWindow):
     def _ensure_yolo_model(self, model_path: Optional[str] = None) -> bool:
         if not YOLO_AVAILABLE:
             self._toast(f"[YOLO] 未安装 ultralytics 库: {YOLO_IMPORT_ERROR}")
-            if hasattr(self, "chk_yolo"):
-                self.chk_yolo.setChecked(False)
-            self.yolo_enabled = False
             return False
 
-        path = self._normalized_model_path(model_path or self.yolo_model_path or DEFAULT_YOLO_MODEL)
+        path = self._normalized_model_path(model_path or self.default_model or DEFAULT_YOLO_MODEL)
 
         if path in self.yolo_model_cache:
             return True
 
         if not os.path.exists(path):
             self._toast(f"[YOLO] 模型文件不存在: {path}")
-            if hasattr(self, "chk_yolo"):
-                self.chk_yolo.setChecked(False)
-            self.yolo_enabled = False
             return False
 
         try:
             self.yolo_model_cache[path] = YOLO(path)
-            self.yolo_model_path = path
             self._toast(f"[YOLO] 模型已加载: {os.path.basename(path)}", ms=2000)
             return True
         except Exception as exc:
             self._toast(f"[YOLO] 加载模型失败: {exc}")
-            if hasattr(self, "chk_yolo"):
-                self.chk_yolo.setChecked(False)
-            self.yolo_enabled = False
             return False
 
     def _model_for_cam(self, cam_index: int) -> Optional[YOLO]:
-        model_path = self.slot_model_paths.get(cam_index) or self.yolo_model_path or DEFAULT_YOLO_MODEL
+        model_path = self.slot_model_paths.get(cam_index) or self.default_model or DEFAULT_YOLO_MODEL
         norm_path = self._normalized_model_path(model_path)
         if norm_path not in self.yolo_model_cache:
             if not self._ensure_yolo_model(norm_path):
@@ -1690,87 +1713,82 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------- 摄像头控制 ----------
     def _start_camera(self):
         self.stop_camera()
-        src = self._current_source()
         self.active_slots = []
+        self._refresh_hik_devices()
+        self._refresh_usb_indices()
+        for slot in (1, 2):
+            self._start_slot(slot)
+        self._update_video_visibility()
 
-        if src == "hik":
-            self._refresh_hik_devices()
+    def _start_slot(self, slot: int):
+        self._stop_slot(slot)
+        source = self._slot_source(slot)
+        if source == "hik":
             if not self.hik_devices:
-                self._toast("未发现可用的海康相机")
-                self._update_video_visibility()
+                self._toast(f"未发现可用的海康相机（{slot}）")
                 return
-
-            max_slots = min(2, len(self.hik_devices))
-            for slot in range(1, max_slots + 1):
-                try:
-                    grabber = HikGrabber(self, device_index=slot - 1)
-                except Exception as exc:
-                    self._toast(f"海康{slot}启动失败：{exc}")
-                    continue
-                self.grabbers[slot] = grabber
-                grabber.frameSignal.connect(lambda frame, s=slot: self.on_frame(s, frame))
-                grabber.infoSignal.connect(lambda msg, s=slot: self.on_info(s, msg))
-                grabber.errorSignal.connect(self._on_grabber_error)
-                grabber.start()
-                self.active_slots.append(slot)
-
-            self._update_video_visibility()
-            return
-
-        indices = list(self.usb_indices or [])
-        if not indices:
-            indices = scan_usb_indices(max_index=10)
-            self.usb_indices = list(indices)
-
-        if not indices:
-            self._toast("未发现可用的 USB 摄像头")
-            self._update_video_visibility()
-            return
-
-        ordered = []
-        primary = int(self.usb_index) if self.usb_index in indices else int(indices[0])
-        ordered.append(primary)
-        for idx in indices:
-            if idx == primary:
-                continue
-            ordered.append(int(idx))
-            if len(ordered) >= 2:
-                break
-
-        max_slots = min(2, len(ordered))
-        for slot in range(1, max_slots + 1):
-            idx = ordered[slot - 1]
+            idx = self.hik_indices.get(slot, 0)
+            if idx >= len(self.hik_devices):
+                idx = 0
+                self.hik_indices[slot] = 0
+            try:
+                grabber = HikGrabber(self, device_index=int(idx))
+            except Exception as exc:
+                self._toast(f"海康{slot}启动失败：{exc}")
+                return
+        else:
+            indices = list(self.usb_indices or [])
+            if not indices:
+                self._toast(f"未发现可用的 USB 摄像头（{slot}）")
+                return
+            idx = self.usb_indices_selected.get(slot, indices[0])
+            if idx not in indices:
+                idx = int(indices[0])
+                self.usb_indices_selected[slot] = idx
             try:
                 grabber = UsbGrabber(self, index=int(idx))
             except Exception as exc:
                 self._toast(f"USB{slot} 启动失败：{exc}")
-                continue
-            self.grabbers[slot] = grabber
-            grabber.frameSignal.connect(lambda frame, s=slot: self.on_frame(s, frame))
-            grabber.infoSignal.connect(lambda msg, s=slot: self.on_info(s, msg))
-            grabber.errorSignal.connect(self._on_grabber_error)
-            grabber.start()
-            self.active_slots.append(slot)
+                return
 
-        self._update_video_visibility()
+        self.grabbers[slot] = grabber
+        grabber.frameSignal.connect(lambda frame, s=slot: self.on_frame(s, frame))
+        grabber.infoSignal.connect(lambda msg, s=slot: self.on_info(s, msg))
+        grabber.errorSignal.connect(self._on_grabber_error)
+        grabber.start()
+        if slot not in self.active_slots:
+            self.active_slots.append(slot)
 
     @QtCore.pyqtSlot(str)
     def _on_grabber_error(self, message: str):
         self._toast(message)
 
-    def reopen_camera(self):
-        self._start_camera()
+    def reopen_camera(self, slot: Optional[int] = None):
+        if slot is None:
+            self._start_camera()
+        else:
+            self._start_slot(int(slot))
 
-    def stop_camera(self):
-        for grabber in list(self.grabbers.values()):
-            if grabber and grabber.isRunning():
-                try:
-                    grabber.stop()  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-                grabber.wait(1000)
-        self.grabbers.clear()
-        self.active_slots = []
+    def _stop_slot(self, slot: int):
+        grabber = self.grabbers.pop(slot, None)
+        if grabber and getattr(grabber, "isRunning", lambda: False)():
+            try:
+                grabber.stop()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            grabber.wait(1000)
+        if slot in self.active_slots:
+            try:
+                self.active_slots.remove(slot)
+            except ValueError:
+                pass
+
+    def stop_camera(self, slot: Optional[int] = None):
+        if slot is None:
+            for s in list(self.grabbers.keys()):
+                self._stop_slot(int(s))
+        else:
+            self._stop_slot(int(slot))
         self._update_video_visibility()
 
     # ---------- 信号槽 ----------
@@ -1791,13 +1809,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         frame_to_show = frame_bgr
 
-        if getattr(self, "chk_yolo", None) is not None and self.chk_yolo.isChecked():
-            self.yolo_enabled = True
-            target_model = self.slot_model_paths.get(cam_index, self.yolo_model_path)
+        widgets = self.slot_widgets.get(cam_index, {})
+        chk: QtWidgets.QCheckBox = widgets.get("chk_yolo")  # type: ignore
+        use_yolo = bool(chk.isChecked()) if chk is not None else False
+        if use_yolo:
+            target_model = self.slot_model_paths.get(cam_index, self.default_model)
             if self._ensure_yolo_model(target_model):
                 frame_to_show = self._apply_yolo(cam_index, frame_bgr)
-        else:
-            self.yolo_enabled = False
 
         rgb = cv2.cvtColor(frame_to_show, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape

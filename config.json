@@ -6,9 +6,5 @@
   "class_map": {
     "person": 1,
     "car": 2
-  },
-  "models": [
-    "best2.pt",
-    "best.pt"
-  ]
+  }
 }
