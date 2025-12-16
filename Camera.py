@@ -52,11 +52,12 @@ UI_PAINT_FPS = 12.0
 CONFIG_PATH = "config.json"
 
 TRIGGER_REGISTER_ADDR = 0
-RESULT_REGISTER_ADDR = 1
+RESULT_REGISTER_ADDR_1 = 1
+RESULT_REGISTER_ADDR_2 = 2
 
 APP_TITLE = "Camera"
 APP_ICON = "Camera.ico"
-DEFAULT_YOLO_MODEL = "best.pt"
+DEFAULT_YOLO_MODEL = "best2.pt"
 
 # ---------------------- SDK import (HIK MVS) ----------------------
 try:
@@ -140,9 +141,13 @@ def load_config(path: str = CONFIG_PATH) -> Dict:
         cfg = {
             "server": {"host": "0.0.0.0", "port": 502},
             "class_map": {},
+            "default_model": DEFAULT_YOLO_MODEL,
+            "models": [DEFAULT_YOLO_MODEL],
         }
     cfg.setdefault("server", {"host": "0.0.0.0", "port": 502})
     cfg.setdefault("class_map", {})
+    cfg.setdefault("default_model", DEFAULT_YOLO_MODEL)
+    cfg.setdefault("models", [DEFAULT_YOLO_MODEL])
     return cfg
 
 
@@ -178,6 +183,89 @@ def scan_usb_indices(max_index: int = 10) -> List[int]:
         if ok:
             found.append(i)
     return found or [0]
+
+
+def _hik_decode_text(buf) -> str:
+    try:
+        raw = bytes(bytearray(buf))
+    except Exception:
+        return ""
+    raw = raw.split(b"\0", 1)[0]
+    try:
+        return raw.decode("utf-8", errors="ignore").strip()
+    except Exception:
+        return ""
+
+
+def _hik_uint_to_ip(value: int) -> str:
+    try:
+        return socket.inet_ntoa(struct.pack(">I", value))
+    except Exception:
+        return ""
+
+
+def _hik_is_same_lan(info, local_ip_int: Optional[int]) -> bool:
+    if not local_ip_int:
+        return False
+    try:
+        gige = info.SpecialInfo.stGigEInfo
+        cam_ip = int(gige.nCurrentIp)
+        mask = int(gige.nCurrentSubNetMask) or 0xFFFFFFFF
+        return (local_ip_int & mask) == (cam_ip & mask)
+    except Exception:
+        return False
+
+
+def _hik_format_device_name(info, local_ip_int: Optional[int]) -> str:
+    try:
+        gige = info.SpecialInfo.stGigEInfo
+        name = _hik_decode_text(gige.chUserDefinedName) or _hik_decode_text(gige.chModelName)
+        ip = _hik_uint_to_ip(int(gige.nCurrentIp))
+        if name and ip:
+            base = f"{name} ({ip})"
+        elif ip:
+            base = f"Hik GIGE ({ip})"
+        else:
+            base = name or "Hik GIGE"
+        if _hik_is_same_lan(info, local_ip_int):
+            return base + " | 本地网段"
+        return base
+    except Exception:
+        return "Hik GIGE"
+
+
+def enumerate_hik_devices() -> List[tuple]:
+    """Return available HIK devices sorted with same-LAN ones first."""
+
+    if not HIK_SDK_AVAILABLE or MvCamera is None:
+        return []
+
+    dev_list = MV_CC_DEVICE_INFO_LIST()
+    ret = MvCamera.MV_CC_EnumDevices(MV_GIGE_DEVICE, dev_list)
+    if ret != MV_OK or dev_list.nDeviceNum == 0:
+        return []
+
+    local_ip_int = None
+    try:
+        local_ip_int = struct.unpack(">I", socket.inet_aton(get_local_ip()))[0]
+    except Exception:
+        local_ip_int = None
+
+    candidates = []
+    for idx in range(int(dev_list.nDeviceNum)):
+        ptr = dev_list.pDeviceInfo[idx]
+        if not ptr:
+            continue
+        info_copy = MV_CC_DEVICE_INFO()
+        ctypes.memmove(byref(info_copy), byref(ptr.contents), ctypes.sizeof(MV_CC_DEVICE_INFO))
+        if not MvCamera.MV_CC_IsDeviceAccessible(info_copy, MV_ACCESS_Exclusive):
+            continue
+        display = _hik_format_device_name(info_copy, local_ip_int)
+        same_lan = _hik_is_same_lan(info_copy, local_ip_int)
+        candidates.append((info_copy, display, same_lan))
+
+    candidates.sort(key=lambda item: (not item[2], item[1]))
+    return candidates
 
 
 # ---------------------- Modbus ----------------------
@@ -310,11 +398,13 @@ class HikGrabber(QtCore.QThread):
     errorSignal = QtCore.pyqtSignal(str)
     autoAdjustSignal = QtCore.pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, device_index: int = 0):
         super().__init__(parent)
         if not HIK_SDK_AVAILABLE or MvCamera is None:
             reason = str(HIK_SDK_IMPORT_ERROR) if HIK_SDK_IMPORT_ERROR else "未检测到海康 SDK"
             raise RuntimeError(f"海康 SDK 未就绪: {reason}")
+
+        self.device_index = int(device_index)
 
         self.camera: Optional["MvCamera"] = None
         self._running = False
@@ -390,32 +480,6 @@ class HikGrabber(QtCore.QThread):
             return name or "Hik GIGE"
         except Exception:
             return "Hik GIGE"
-
-    def _select_device(self):
-        dev_list = MV_CC_DEVICE_INFO_LIST()
-        ret = MvCamera.MV_CC_EnumDevices(MV_GIGE_DEVICE, dev_list)
-        if ret != MV_OK:
-            raise RuntimeError(f"枚举海康相机失败: 0x{ret:08X}")
-        if dev_list.nDeviceNum == 0:
-            return None
-
-        accessible_candidates = []
-        for idx in range(int(dev_list.nDeviceNum)):
-            ptr = dev_list.pDeviceInfo[idx]
-            if not ptr:
-                continue
-            info_copy = MV_CC_DEVICE_INFO()
-            ctypes.memmove(byref(info_copy), byref(ptr.contents), ctypes.sizeof(MV_CC_DEVICE_INFO))
-            if not MvCamera.MV_CC_IsDeviceAccessible(info_copy, MV_ACCESS_Exclusive):
-                continue
-            display = self._format_device_name(info_copy)
-            if self._is_same_lan(info_copy):
-                return info_copy, display
-            accessible_candidates.append((info_copy, display))
-
-        if accessible_candidates:
-            return accessible_candidates[0]
-        return None
 
     def _prepare_payload(self):
         payload = MVCC_INTVALUE()
@@ -558,11 +622,14 @@ class HikGrabber(QtCore.QThread):
                 raise RuntimeError(f"初始化海康 SDK 失败: 0x{ret:08X}")
             initialized = True
 
-            selection = self._select_device()
-            if not selection:
+            devices = enumerate_hik_devices()
+            if not devices:
                 raise RuntimeError("未发现可用的海康相机")
 
-            device_info, display_name = selection
+            if self.device_index >= len(devices):
+                raise RuntimeError(f"海康相机索引 {self.device_index + 1} 不存在")
+
+            device_info, display_name, _ = devices[self.device_index]
             self.camera = MvCamera()
 
             ret = self.camera.MV_CC_CreateHandle(device_info)
@@ -730,7 +797,7 @@ class UsbGrabber(QtCore.QThread):
 
 # ---------------------- Main UI ----------------------
 class MainWindow(QtWidgets.QMainWindow):
-    modbus_trigger_sig = QtCore.pyqtSignal()
+    modbus_trigger_sig = QtCore.pyqtSignal(int)
 
     def __init__(self):
         super().__init__()
@@ -738,6 +805,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.config = load_config(CONFIG_PATH)
         server_cfg = self.config.get("server", {})
         self.class_map: Dict[str, int] = {k: int(v) for k, v in self.config.get("class_map", {}).items()}
+        self.models: List[str] = list(dict.fromkeys(self.config.get("models", []) or [DEFAULT_YOLO_MODEL]))
+        self.default_model: str = str(self.config.get("default_model") or DEFAULT_YOLO_MODEL)
+        if self.default_model and self.default_model not in self.models:
+            self.models.insert(0, self.default_model)
         self.modbus_host = str(server_cfg.get("host", "0.0.0.0") or "0.0.0.0")
         self.modbus_port = int(server_cfg.get("port", 502))
         self.modbus_model = ModbusRegisterModel(size=8)
@@ -748,17 +819,20 @@ class MainWindow(QtWidgets.QMainWindow):
         # 默认摄像头配置
         self.source = "hik"   # "hik" / "usb"
         self.usb_index = 0
+        self.hik_devices: List[tuple] = []
+        self.active_slots: List[int] = []
 
         # 默认 YOLO 配置
         self.yolo_enabled = False
         self.yolo_conf = 0.5
-        self.yolo_model_path = DEFAULT_YOLO_MODEL
+        self.yolo_model_path = self.default_model if self.default_model in self.models else DEFAULT_YOLO_MODEL
         self.yolo_model = None
         self.yolo_style = 0     # 0~7 不同样式
 
+        self.last_frame_bgrs: Dict[int, np.ndarray] = {}
         self.last_frame_bgr: Optional[np.ndarray] = None
-        self._last_paint_ts = 0.0
-        self.grabber: Optional[QtCore.QThread] = None
+        self._last_paint_ts: Dict[int, float] = {}
+        self.grabbers: Dict[int, QtCore.QThread] = {}
 
         self._start_modbus_server(self.modbus_host)
 
@@ -799,6 +873,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.source_combo.setCurrentIndex(idx)
         self.source_combo.currentIndexChanged.connect(self._on_source_changed)
         form.addRow("摄像头：", self.source_combo)
+
+        self.lbl_hik_devices = QtWidgets.QLabel("—")
+        self.lbl_hik_devices.setWordWrap(True)
+        form.addRow("海康索引：", self.lbl_hik_devices)
 
         usb_row = QtWidgets.QHBoxLayout()
         self.usb_index_combo = QtWidgets.QComboBox()
@@ -848,6 +926,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_conf.valueChanged.connect(self._on_yolo_conf_changed)
         yolo_form.addRow("可信度：", self.spin_conf)
 
+        self.combo_model = QtWidgets.QComboBox()
+        for m in self.models:
+            self.combo_model.addItem(os.path.basename(m), m)
+        idx_model = self.combo_model.findData(self.yolo_model_path)
+        if idx_model >= 0:
+            self.combo_model.setCurrentIndex(idx_model)
+        self.combo_model.currentIndexChanged.connect(self._on_yolo_model_changed)
+        yolo_form.addRow("模型：", self.combo_model)
+
         self.combo_style = QtWidgets.QComboBox()
         self.combo_style.addItem("经典绿色框", 0)
         self.combo_style.addItem("相机准星 + 红点", 1)
@@ -870,8 +957,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.lbl_modbus_status = QtWidgets.QLabel("—")
         self.lbl_modbus_reg1 = QtWidgets.QLabel("—")
+        self.lbl_modbus_reg2 = QtWidgets.QLabel("—")
         modbus_form.addRow("状态：", self.lbl_modbus_status)
         modbus_form.addRow("寄存器1：", self.lbl_modbus_reg1)
+        modbus_form.addRow("寄存器2：", self.lbl_modbus_reg2)
 
         left_lay.addStretch(1)
 
@@ -882,21 +971,36 @@ class MainWindow(QtWidgets.QMainWindow):
         right_lay.setContentsMargins(8, 8, 8, 8)
         right_lay.setSpacing(8)
 
-        header = QtWidgets.QHBoxLayout()
-        self.lbl_cam = QtWidgets.QLabel("Camera: —")
-        self.lbl_fps = QtWidgets.QLabel("FPS: —")
-        header.addWidget(self.lbl_cam, 1)
-        header.addWidget(self.lbl_fps, 0, QtCore.Qt.AlignRight)
-        right_lay.addLayout(header)
+        header_grid = QtWidgets.QGridLayout()
+        self.lbl_cam1 = QtWidgets.QLabel("摄像头1: —")
+        self.lbl_fps1 = QtWidgets.QLabel("FPS1: —")
+        self.lbl_cam2 = QtWidgets.QLabel("摄像头2: —")
+        self.lbl_fps2 = QtWidgets.QLabel("FPS2: —")
+        header_grid.addWidget(self.lbl_cam1, 0, 0)
+        header_grid.addWidget(self.lbl_fps1, 0, 1, QtCore.Qt.AlignRight)
+        header_grid.addWidget(self.lbl_cam2, 1, 0)
+        header_grid.addWidget(self.lbl_fps2, 1, 1, QtCore.Qt.AlignRight)
+        right_lay.addLayout(header_grid)
 
-        self.video_lbl = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
-        self.video_lbl.setMinimumSize(640, 480)
-        self.video_lbl.setFrameShape(QtWidgets.QFrame.StyledPanel)
-        self.video_lbl.setAutoFillBackground(True)
-        pal = self.video_lbl.palette()
+        video_row = QtWidgets.QHBoxLayout()
+        self.video_lbl1 = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
+        self.video_lbl1.setMinimumSize(480, 360)
+        self.video_lbl1.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        self.video_lbl1.setAutoFillBackground(True)
+
+        self.video_lbl2 = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
+        self.video_lbl2.setMinimumSize(480, 360)
+        self.video_lbl2.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        self.video_lbl2.setAutoFillBackground(True)
+
+        pal = self.video_lbl1.palette()
         pal.setColor(QtGui.QPalette.Window, QtGui.QColor(30, 30, 30))
-        self.video_lbl.setPalette(pal)
-        right_lay.addWidget(self.video_lbl, 1)
+        self.video_lbl1.setPalette(pal)
+        self.video_lbl2.setPalette(pal)
+
+        video_row.addWidget(self.video_lbl1, 1)
+        video_row.addWidget(self.video_lbl2, 1)
+        right_lay.addLayout(video_row, 1)
 
         self.status_label = QtWidgets.QLabel("就绪")
         self.status_label.setMinimumHeight(22)
@@ -913,6 +1017,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.modbus_ui_timer.start()
         self._refresh_modbus_status()
 
+        self._refresh_hik_devices()
         self._refresh_usb_indices()
         self._update_usb_controls_enabled()
         self._start_camera()
@@ -924,6 +1029,37 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------- UI 逻辑 ----------
     def _current_source(self) -> str:
         return str(self.source_combo.currentData() or "hik")
+
+    def _video_label_for(self, cam_index: int) -> Optional[QtWidgets.QLabel]:
+        return self.video_lbl1 if cam_index == 1 else self.video_lbl2 if cam_index == 2 else None
+
+    def _update_video_visibility(self):
+        has_cam2 = 2 in self.active_slots
+        if getattr(self.video_lbl2, "setVisible", None):
+            self.video_lbl2.setVisible(has_cam2)
+        if getattr(self.lbl_cam2, "setVisible", None):
+            self.lbl_cam2.setVisible(has_cam2)
+        if getattr(self.lbl_fps2, "setVisible", None):
+            self.lbl_fps2.setVisible(has_cam2)
+        if not has_cam2:
+            lbl2 = self._video_label_for(2)
+            if lbl2:
+                lbl2.clear()
+                lbl2.setText("无信号")
+
+    def _refresh_hik_devices(self):
+        try:
+            devices = enumerate_hik_devices()
+        except Exception as exc:
+            devices = []
+            self._toast(f"海康枚举失败: {exc}")
+        self.hik_devices = devices
+        if getattr(self, "lbl_hik_devices", None) is not None:
+            if devices:
+                names = [f"摄像头{idx + 1}" for idx in range(len(devices))]
+                self.lbl_hik_devices.setText(", ".join(names))
+            else:
+                self.lbl_hik_devices.setText("未发现")
 
     def _refresh_usb_indices(self):
         indices = scan_usb_indices(max_index=10)
@@ -972,11 +1108,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self._start_camera()
 
     def _on_auto_adjust_clicked(self):
-        grabber = getattr(self, "grabber", None)
-        if not isinstance(grabber, HikGrabber):
+        target = None
+        for g in self.grabbers.values():
+            if isinstance(g, HikGrabber):
+                target = g
+                break
+        if target is None:
             self._toast("当前非海康相机，无法自动调节")
             return
-        grabber.autoAdjustSignal.emit()
+        target.autoAdjustSignal.emit()
         self._toast("正在自动调节...")
 
     # ---------- YOLO 控制 ----------
@@ -987,6 +1127,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_yolo_conf_changed(self, value: float):
         self.yolo_conf = max(0.0, min(1.0, float(value)))
+
+    def _on_yolo_model_changed(self, index: int):
+        if index < 0:
+            return
+        data = self.combo_model.itemData(index)
+        model_path = str(data or self.combo_model.currentText() or "").strip()
+        if not model_path:
+            return
+        if model_path != self.yolo_model_path:
+            self.yolo_model_path = model_path
+            self.yolo_model = None
+            if self.yolo_enabled:
+                self._ensure_yolo_model()
 
     def _on_yolo_style_changed(self, index: int):
         data = self.combo_style.itemData(index)
@@ -1289,16 +1442,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self._toast(f"[YOLO] 推理异常: {exc}")
             return frame_bgr
 
-    def _run_yolo_recognition(self) -> int:
-        if self.last_frame_bgr is None:
-            self._toast("未捕获画面")
+    def _run_yolo_recognition(self, cam_index: int) -> int:
+        frame = self.last_frame_bgrs.get(cam_index)
+        if frame is None:
+            self._toast(f"摄像头{cam_index} 未捕获画面")
             return 0xFF
 
         if not self._ensure_yolo_model():
             return 0xFF
 
         try:
-            results = self.yolo_model(self.last_frame_bgr, conf=float(self.yolo_conf), verbose=False)
+            results = self.yolo_model(frame, conf=float(self.yolo_conf), verbose=False)
         except Exception as exc:
             self._toast(f"[YOLO] 推理异常: {exc}")
             return 0xFF
@@ -1347,11 +1501,11 @@ class MainWindow(QtWidgets.QMainWindow):
         return int(mapped) & 0xFFFF
 
     # ---------- Modbus ----------
-    def _publish_modbus_result(self, value: int):
+    def _publish_modbus_result(self, addr: int, value: int):
         model = getattr(self, "modbus_model", None)
         if not model:
             return
-        model.set_register(RESULT_REGISTER_ADDR, int(value) & 0xFFFF)
+        model.set_register(addr, int(value) & 0xFFFF)
         self._refresh_modbus_status()
 
     def _refresh_modbus_status(self):
@@ -1364,33 +1518,41 @@ class MainWindow(QtWidgets.QMainWindow):
         if getattr(self, "lbl_modbus_status", None) is not None:
             self.lbl_modbus_status.setText(status_text)
 
-        reg_val = None
+        reg_val_1 = None
+        reg_val_2 = None
         model = getattr(self, "modbus_model", None)
         if model:
             try:
-                vals = model.read(RESULT_REGISTER_ADDR, 1)
-                reg_val = vals[0] if vals else None
+                vals1 = model.read(RESULT_REGISTER_ADDR_1, 1)
+                reg_val_1 = vals1[0] if vals1 else None
+                vals2 = model.read(RESULT_REGISTER_ADDR_2, 1)
+                reg_val_2 = vals2[0] if vals2 else None
             except Exception:
-                reg_val = None
+                reg_val_1 = None
+                reg_val_2 = None
 
-        reg_text = "—" if reg_val is None else f"{reg_val} 0x{int(reg_val) & 0xFFFF:04X}"
+        reg_text_1 = "—" if reg_val_1 is None else f"{reg_val_1} 0x{int(reg_val_1) & 0xFFFF:04X}"
+        reg_text_2 = "—" if reg_val_2 is None else f"{reg_val_2} 0x{int(reg_val_2) & 0xFFFF:04X}"
         if getattr(self, "lbl_modbus_reg1", None) is not None:
-            self.lbl_modbus_reg1.setText(reg_text)
+            self.lbl_modbus_reg1.setText(reg_text_1)
+        if getattr(self, "lbl_modbus_reg2", None) is not None:
+            self.lbl_modbus_reg2.setText(reg_text_2)
 
-    def _handle_recognition_request(self):
-        result_value = self._run_yolo_recognition()
-        self._publish_modbus_result(result_value)
+    def _handle_recognition_request(self, cam_index: int):
+        reg_addr = RESULT_REGISTER_ADDR_1 if cam_index == 1 else RESULT_REGISTER_ADDR_2
+        result_value = self._run_yolo_recognition(cam_index)
+        self._publish_modbus_result(reg_addr, result_value)
         if self.modbus_model:
             self.modbus_model.set_register(TRIGGER_REGISTER_ADDR, 0)
 
     def _on_modbus_write(self, addr: int, value: int):
-        if addr == TRIGGER_REGISTER_ADDR and value == 1:
-            print("[MODBUS] 收到触发请求")
-            self.modbus_trigger_sig.emit()
+        if addr == TRIGGER_REGISTER_ADDR and value in (1, 2):
+            print(f"[MODBUS] 收到触发请求 {value}")
+            self.modbus_trigger_sig.emit(int(value))
 
-    @QtCore.pyqtSlot()
-    def _on_modbus_trigger(self):
-        self._handle_recognition_request()
+    @QtCore.pyqtSlot(int)
+    def _on_modbus_trigger(self, cam_index: int):
+        self._handle_recognition_request(int(cam_index))
 
     def _stop_modbus_server(self):
         if not getattr(self, "modbus_server", None):
@@ -1429,26 +1591,40 @@ class MainWindow(QtWidgets.QMainWindow):
     def _start_camera(self):
         self.stop_camera()
         src = self._current_source()
+        self.active_slots = []
 
         if src == "hik":
-            try:
-                grabber = HikGrabber(self)
-            except Exception as exc:
-                self._toast(f"海康启动失败：{exc}")
+            self._refresh_hik_devices()
+            if not self.hik_devices:
+                self._toast("未发现可用的海康相机")
+                self._update_video_visibility()
                 return
-            self.grabber = grabber
-            grabber.frameSignal.connect(self.on_frame)
-            grabber.infoSignal.connect(self.on_info)
-            grabber.errorSignal.connect(self._on_grabber_error)
-            grabber.start()
+
+            max_slots = min(2, len(self.hik_devices))
+            for slot in range(1, max_slots + 1):
+                try:
+                    grabber = HikGrabber(self, device_index=slot - 1)
+                except Exception as exc:
+                    self._toast(f"海康{slot}启动失败：{exc}")
+                    continue
+                self.grabbers[slot] = grabber
+                grabber.frameSignal.connect(lambda frame, s=slot: self.on_frame(s, frame))
+                grabber.infoSignal.connect(lambda msg, s=slot: self.on_info(s, msg))
+                grabber.errorSignal.connect(self._on_grabber_error)
+                grabber.start()
+                self.active_slots.append(slot)
+
+            self._update_video_visibility()
             return
 
         grabber = UsbGrabber(self, index=int(self.usb_index))
-        self.grabber = grabber
-        grabber.frameSignal.connect(self.on_frame)
-        grabber.infoSignal.connect(self.on_info)
+        self.grabbers[1] = grabber
+        grabber.frameSignal.connect(lambda frame, s=1: self.on_frame(s, frame))
+        grabber.infoSignal.connect(lambda msg, s=1: self.on_info(s, msg))
         grabber.errorSignal.connect(self._on_grabber_error)
         grabber.start()
+        self.active_slots.append(1)
+        self._update_video_visibility()
 
     @QtCore.pyqtSlot(str)
     def _on_grabber_error(self, message: str):
@@ -1458,26 +1634,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self._start_camera()
 
     def stop_camera(self):
-        grabber = getattr(self, "grabber", None)
-        if grabber and grabber.isRunning():
-            try:
-                grabber.stop()  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            grabber.wait(1000)
-        self.grabber = None
+        for grabber in list(self.grabbers.values()):
+            if grabber and grabber.isRunning():
+                try:
+                    grabber.stop()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                grabber.wait(1000)
+        self.grabbers.clear()
+        self.active_slots = []
+        self._update_video_visibility()
 
     # ---------- 信号槽 ----------
-    @QtCore.pyqtSlot(np.ndarray)
-    def on_frame(self, frame_bgr: np.ndarray):
+    @QtCore.pyqtSlot(int, np.ndarray)
+    def on_frame(self, cam_index: int, frame_bgr: np.ndarray):
         t = time.time()
-        if (t - self._last_paint_ts) < (1.0 / UI_PAINT_FPS):
+        last_ts = self._last_paint_ts.get(cam_index, 0.0)
+        if (t - last_ts) < (1.0 / UI_PAINT_FPS):
             return
-        self._last_paint_ts = t
+        self._last_paint_ts[cam_index] = t
 
-        self.last_frame_bgr = frame_bgr
         if frame_bgr is None or frame_bgr.size == 0:
             return
+
+        self.last_frame_bgrs[cam_index] = frame_bgr
+        if cam_index == 1:
+            self.last_frame_bgr = frame_bgr
 
         frame_to_show = frame_bgr
 
@@ -1492,19 +1674,25 @@ class MainWindow(QtWidgets.QMainWindow):
         h, w, ch = rgb.shape
         qimg = QtGui.QImage(rgb.data, w, h, ch * w, QtGui.QImage.Format_RGB888)
         pix = QtGui.QPixmap.fromImage(qimg)
+        lbl = self._video_label_for(cam_index)
+        if not lbl:
+            return
         scaled = pix.scaled(
-            self.video_lbl.size(),
+            lbl.size(),
             QtCore.Qt.KeepAspectRatio,
             QtCore.Qt.FastTransformation,
         )
-        self.video_lbl.setPixmap(scaled)
+        lbl.setPixmap(scaled)
 
-    @QtCore.pyqtSlot(str)
-    def on_info(self, s: str):
+    @QtCore.pyqtSlot(int, str)
+    def on_info(self, cam_index: int, s: str):
+        cam_label = self.lbl_cam1 if cam_index == 1 else self.lbl_cam2
+        fps_label = self.lbl_fps1 if cam_index == 1 else self.lbl_fps2
+
         if s.startswith("[INFO]"):
-            self.lbl_cam.setText("Camera: " + s.replace("[INFO]", "").strip())
+            cam_label.setText(f"摄像头{cam_index}: " + s.replace("[INFO]", "").strip())
         elif s.startswith("[FPS]"):
-            self.lbl_fps.setText("FPS: " + s.replace("[FPS]", "").strip())
+            fps_label.setText(f"FPS{cam_index}: " + s.replace("[FPS]", "").strip())
         elif s.startswith("[HIK]") or s.startswith("[USB]"):
             self._toast(s)
 
