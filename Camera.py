@@ -141,12 +141,10 @@ def load_config(path: str = CONFIG_PATH) -> Dict:
         cfg = {
             "server": {"host": "0.0.0.0", "port": 502},
             "class_map": {},
-            "default_model": DEFAULT_YOLO_MODEL,
             "models": [DEFAULT_YOLO_MODEL],
         }
     cfg.setdefault("server", {"host": "0.0.0.0", "port": 502})
     cfg.setdefault("class_map", {})
-    cfg.setdefault("default_model", DEFAULT_YOLO_MODEL)
     cfg.setdefault("models", [DEFAULT_YOLO_MODEL])
     return cfg
 
@@ -806,9 +804,7 @@ class MainWindow(QtWidgets.QMainWindow):
         server_cfg = self.config.get("server", {})
         self.class_map: Dict[str, int] = {k: int(v) for k, v in self.config.get("class_map", {}).items()}
         self.models: List[str] = list(dict.fromkeys(self.config.get("models", []) or [DEFAULT_YOLO_MODEL]))
-        self.default_model: str = str(self.config.get("default_model") or DEFAULT_YOLO_MODEL)
-        if self.default_model and self.default_model not in self.models:
-            self.models.insert(0, self.default_model)
+        self.default_model: str = self.models[0] if self.models else DEFAULT_YOLO_MODEL
         self.modbus_host = str(server_cfg.get("host", "0.0.0.0") or "0.0.0.0")
         self.modbus_port = int(server_cfg.get("port", 502))
         self.modbus_model = ModbusRegisterModel(size=8)
@@ -874,10 +870,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.source_combo.currentIndexChanged.connect(self._on_source_changed)
         form.addRow("摄像头：", self.source_combo)
 
-        self.lbl_hik_devices = QtWidgets.QLabel("—")
-        self.lbl_hik_devices.setWordWrap(True)
-        form.addRow("海康索引：", self.lbl_hik_devices)
-
         usb_row = QtWidgets.QHBoxLayout()
         self.usb_index_combo = QtWidgets.QComboBox()
         self.btn_usb_refresh = QtWidgets.QPushButton("刷新")
@@ -887,7 +879,17 @@ class MainWindow(QtWidgets.QMainWindow):
         usb_row.addWidget(self.btn_usb_refresh, 0)
         usb_wrap = QtWidgets.QWidget()
         usb_wrap.setLayout(usb_row)
-        form.addRow("索引：", usb_wrap)
+
+        self.lbl_hik_devices = QtWidgets.QLabel("—")
+        self.lbl_hik_devices.setWordWrap(True)
+
+        self.idx_stack = QtWidgets.QStackedWidget()
+        self.idx_stack.setContentsMargins(0, 0, 0, 0)
+        self.idx_stack.addWidget(self.lbl_hik_devices)
+        self.idx_stack.addWidget(usb_wrap)
+
+        self.usb_index_wrap = usb_wrap
+        form.addRow("索引：", self.idx_stack)
 
         # 控制分组
         gb_ctrl = QtWidgets.QGroupBox("控制")
@@ -1054,12 +1056,7 @@ class MainWindow(QtWidgets.QMainWindow):
             devices = []
             self._toast(f"海康枚举失败: {exc}")
         self.hik_devices = devices
-        if getattr(self, "lbl_hik_devices", None) is not None:
-            if devices:
-                names = [f"摄像头{idx + 1}" for idx in range(len(devices))]
-                self.lbl_hik_devices.setText(", ".join(names))
-            else:
-                self.lbl_hik_devices.setText("未发现")
+        self._update_index_controls()
 
     def _refresh_usb_indices(self):
         indices = scan_usb_indices(max_index=10)
@@ -1084,7 +1081,27 @@ class MainWindow(QtWidgets.QMainWindow):
         is_usb = (self._current_source() == "usb")
         self.usb_index_combo.setEnabled(is_usb)
         self.btn_usb_refresh.setEnabled(is_usb)
+        self._update_index_controls()
         self._update_control_buttons_enabled()
+
+    def _update_index_controls(self):
+        is_usb = (self._current_source() == "usb")
+        if getattr(self, "idx_stack", None) is not None:
+            target = self.usb_index_wrap if is_usb else self.lbl_hik_devices
+            self.idx_stack.setCurrentWidget(target)
+
+        if getattr(self, "lbl_hik_devices", None) is not None:
+            device_count = len(self.hik_devices)
+            if device_count > 1:
+                names = [f"摄像头{idx + 1}" for idx in range(device_count)]
+                self.lbl_hik_devices.setText(", ".join(names))
+                self.lbl_hik_devices.setVisible(True)
+            elif device_count == 0:
+                self.lbl_hik_devices.setText("未发现")
+                self.lbl_hik_devices.setVisible(True)
+            else:
+                self.lbl_hik_devices.setText("—")
+                self.lbl_hik_devices.setVisible(False)
 
     def _update_control_buttons_enabled(self):
         is_hik = (self._current_source() == "hik")

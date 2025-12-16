@@ -7,7 +7,6 @@
     "person": 1,
     "car": 2
   },
-  "default_model": "best2.pt",
   "models": [
     "best2.pt",
     "best.pt"
