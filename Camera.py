@@ -816,6 +816,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.source = "hik"   # "hik" / "usb"
         self.hik_index = 0
         self.usb_index = 0
+        self.usb_indices: List[int] = []
         self.hik_devices: List[tuple] = []
         self.active_slots: List[int] = []
 
@@ -1087,6 +1088,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _refresh_usb_indices(self):
         indices = scan_usb_indices(max_index=10)
+        self.usb_indices = list(indices)
         blocker = QtCore.QSignalBlocker(self.usb_index_combo)
         self.usb_index_combo.clear()
         for i in indices:
@@ -1125,6 +1127,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_hik_refresh.setEnabled(is_hik)
             if device_count == 0:
                 self.hik_index_combo.clear()
+
+        if getattr(self, "usb_index_combo", None) is not None:
+            usb_count = len(self.usb_indices)
+            enable_usb = usb_count > 1 and is_usb
+            self.usb_index_combo.setEnabled(enable_usb)
+            self.btn_usb_refresh.setEnabled(is_usb)
 
     def _update_control_buttons_enabled(self):
         is_hik = (self._current_source() == "hik")
@@ -1665,13 +1673,41 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_video_visibility()
             return
 
-        grabber = UsbGrabber(self, index=int(self.usb_index))
-        self.grabbers[1] = grabber
-        grabber.frameSignal.connect(lambda frame, s=1: self.on_frame(s, frame))
-        grabber.infoSignal.connect(lambda msg, s=1: self.on_info(s, msg))
-        grabber.errorSignal.connect(self._on_grabber_error)
-        grabber.start()
-        self.active_slots.append(1)
+        indices = list(self.usb_indices or [])
+        if not indices:
+            indices = scan_usb_indices(max_index=10)
+            self.usb_indices = list(indices)
+
+        if not indices:
+            self._toast("未发现可用的 USB 摄像头")
+            self._update_video_visibility()
+            return
+
+        ordered = []
+        primary = int(self.usb_index) if self.usb_index in indices else int(indices[0])
+        ordered.append(primary)
+        for idx in indices:
+            if idx == primary:
+                continue
+            ordered.append(int(idx))
+            if len(ordered) >= 2:
+                break
+
+        max_slots = min(2, len(ordered))
+        for slot in range(1, max_slots + 1):
+            idx = ordered[slot - 1]
+            try:
+                grabber = UsbGrabber(self, index=int(idx))
+            except Exception as exc:
+                self._toast(f"USB{slot} 启动失败：{exc}")
+                continue
+            self.grabbers[slot] = grabber
+            grabber.frameSignal.connect(lambda frame, s=slot: self.on_frame(s, frame))
+            grabber.infoSignal.connect(lambda msg, s=slot: self.on_info(s, msg))
+            grabber.errorSignal.connect(self._on_grabber_error)
+            grabber.start()
+            self.active_slots.append(slot)
+
         self._update_video_visibility()
 
     @QtCore.pyqtSlot(str)
