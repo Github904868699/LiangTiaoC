@@ -308,6 +308,7 @@ class HikGrabber(QtCore.QThread):
     frameSignal = QtCore.pyqtSignal(np.ndarray)
     infoSignal = QtCore.pyqtSignal(str)
     errorSignal = QtCore.pyqtSignal(str)
+    autoAdjustSignal = QtCore.pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -337,6 +338,8 @@ class HikGrabber(QtCore.QThread):
         self._last_stream_error = 0
         self._last_convert_error = 0
         self._last_unsupported_pixel = 0
+
+        self.autoAdjustSignal.connect(self._handle_auto_adjust)
 
     @staticmethod
     def _ip_to_uint(ip: str) -> Optional[int]:
@@ -494,6 +497,33 @@ class HikGrabber(QtCore.QThread):
             self.infoSignal.emit(f"[HIK] 不支持的像素格式: 0x{pixel_type:08X}")
             self._last_unsupported_pixel = pixel_type
         return None
+
+    @QtCore.pyqtSlot()
+    def _handle_auto_adjust(self):
+        cam = getattr(self, "camera", None)
+        if not cam:
+            self.infoSignal.emit("[HIK] 相机未就绪，无法自动调节")
+            return
+
+        def _set_enum(name: str, value: int):
+            try:
+                ret = cam.MV_CC_SetEnumValue(name, value)
+                if ret != MV_OK:
+                    self.infoSignal.emit(f"[HIK] {name} 自动设置失败: 0x{ret:08X}")
+                    return False
+                return True
+            except Exception as exc:
+                self.infoSignal.emit(f"[HIK] {name} 自动设置异常: {exc}")
+                return False
+
+        ok_exp = _set_enum("ExposureAuto", 1)  # 1=Once
+        ok_gain = _set_enum("GainAuto", 1)     # 1=Once
+        ok_wb = _set_enum("BalanceWhiteAuto", 1)  # 1=Once
+
+        if ok_exp or ok_gain or ok_wb:
+            self.infoSignal.emit("[HIK] 已执行一键自动调节")
+        else:
+            self.infoSignal.emit("[HIK] 自动调节失败")
 
     def _cleanup_camera(self):
         if self.camera:
@@ -790,10 +820,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.btn_reopen = QtWidgets.QPushButton("重连")
         self.btn_stop = QtWidgets.QPushButton("停止")
+        self.btn_auto_adjust = QtWidgets.QPushButton("一键自动调节")
         self.btn_reopen.clicked.connect(self.reopen_camera)
         self.btn_stop.clicked.connect(self.stop_camera)
+        self.btn_auto_adjust.clicked.connect(self._on_auto_adjust_clicked)
         ctrl_lay.addWidget(self.btn_reopen, 1)
         ctrl_lay.addWidget(self.btn_stop, 1)
+        ctrl_lay.addWidget(self.btn_auto_adjust, 1)
 
         # YOLO 分组
         gb_yolo = QtWidgets.QGroupBox("YOLO")
@@ -915,10 +948,17 @@ class MainWindow(QtWidgets.QMainWindow):
         is_usb = (self._current_source() == "usb")
         self.usb_index_combo.setEnabled(is_usb)
         self.btn_usb_refresh.setEnabled(is_usb)
+        self._update_control_buttons_enabled()
+
+    def _update_control_buttons_enabled(self):
+        is_hik = (self._current_source() == "hik")
+        if getattr(self, "btn_auto_adjust", None) is not None:
+            self.btn_auto_adjust.setEnabled(is_hik)
 
     def _on_source_changed(self, _index: int):
         self.source = self._current_source()
         self._update_usb_controls_enabled()
+        self._update_control_buttons_enabled()
         self._start_camera()
 
     def _on_usb_index_changed(self, index: int):
@@ -930,6 +970,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.usb_index = int(data)
         if self._current_source() == "usb":
             self._start_camera()
+
+    def _on_auto_adjust_clicked(self):
+        grabber = getattr(self, "grabber", None)
+        if not isinstance(grabber, HikGrabber):
+            self._toast("当前非海康相机，无法自动调节")
+            return
+        grabber.autoAdjustSignal.emit()
+        self._toast("正在自动调节...")
 
     # ---------- YOLO 控制 ----------
     def _on_yolo_enabled_changed(self, state: int):
