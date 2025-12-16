@@ -1311,7 +1311,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if getattr(self, "modbus_error", None):
             status_text = f"错误: {self.modbus_error}"
         elif getattr(self, "modbus_server", None):
-            status_text = f"运行中 {self.modbus_host}:{self.modbus_port}"
+            status_text = f"{self.modbus_host}:{self.modbus_port}"
 
         if getattr(self, "lbl_modbus_status", None) is not None:
             self.lbl_modbus_status.setText(status_text)
@@ -1325,7 +1325,7 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 reg_val = None
 
-        reg_text = "—" if reg_val is None else f"{reg_val} (0x{int(reg_val) & 0xFFFF:04X})"
+        reg_text = "—" if reg_val is None else f"{reg_val} 0x{int(reg_val) & 0xFFFF:04X}"
         if getattr(self, "lbl_modbus_reg1", None) is not None:
             self.lbl_modbus_reg1.setText(reg_text)
 
