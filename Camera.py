@@ -814,6 +814,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 默认摄像头配置
         self.source = "hik"   # "hik" / "usb"
+        self.hik_index = 0
         self.usb_index = 0
         self.hik_devices: List[tuple] = []
         self.active_slots: List[int] = []
@@ -870,6 +871,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.source_combo.currentIndexChanged.connect(self._on_source_changed)
         form.addRow("摄像头：", self.source_combo)
 
+        hik_row = QtWidgets.QHBoxLayout()
+        self.hik_index_combo = QtWidgets.QComboBox()
+        self.btn_hik_refresh = QtWidgets.QPushButton("刷新")
+        self.btn_hik_refresh.setFixedWidth(70)
+        self.btn_hik_refresh.clicked.connect(self._refresh_hik_devices)
+        hik_row.addWidget(self.hik_index_combo, 1)
+        hik_row.addWidget(self.btn_hik_refresh, 0)
+        hik_wrap = QtWidgets.QWidget()
+        hik_wrap.setLayout(hik_row)
+
         usb_row = QtWidgets.QHBoxLayout()
         self.usb_index_combo = QtWidgets.QComboBox()
         self.btn_usb_refresh = QtWidgets.QPushButton("刷新")
@@ -880,14 +891,12 @@ class MainWindow(QtWidgets.QMainWindow):
         usb_wrap = QtWidgets.QWidget()
         usb_wrap.setLayout(usb_row)
 
-        self.lbl_hik_devices = QtWidgets.QLabel("—")
-        self.lbl_hik_devices.setWordWrap(True)
-
         self.idx_stack = QtWidgets.QStackedWidget()
         self.idx_stack.setContentsMargins(0, 0, 0, 0)
-        self.idx_stack.addWidget(self.lbl_hik_devices)
+        self.idx_stack.addWidget(hik_wrap)
         self.idx_stack.addWidget(usb_wrap)
 
+        self.hik_index_wrap = hik_wrap
         self.usb_index_wrap = usb_wrap
         form.addRow("索引：", self.idx_stack)
 
@@ -1056,6 +1065,24 @@ class MainWindow(QtWidgets.QMainWindow):
             devices = []
             self._toast(f"海康枚举失败: {exc}")
         self.hik_devices = devices
+        blocker = QtCore.QSignalBlocker(self.hik_index_combo)
+        self.hik_index_combo.clear()
+        for idx, _info in enumerate(self.hik_devices):
+            self.hik_index_combo.addItem(f"摄像头{idx + 1}", idx)
+        if self.hik_devices:
+            idx = self.hik_index_combo.findData(int(self.hik_index))
+            if idx < 0:
+                idx = 0
+                self.hik_index = int(self.hik_index_combo.itemData(0) or 0)
+            self.hik_index_combo.setCurrentIndex(idx)
+        del blocker
+
+        try:
+            self.hik_index_combo.currentIndexChanged.disconnect()
+        except Exception:
+            pass
+        self.hik_index_combo.currentIndexChanged.connect(self._on_hik_index_changed)
+
         self._update_index_controls()
 
     def _refresh_usb_indices(self):
@@ -1087,21 +1114,17 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_index_controls(self):
         is_usb = (self._current_source() == "usb")
         if getattr(self, "idx_stack", None) is not None:
-            target = self.usb_index_wrap if is_usb else self.lbl_hik_devices
+            target = self.usb_index_wrap if is_usb else self.hik_index_wrap
             self.idx_stack.setCurrentWidget(target)
 
-        if getattr(self, "lbl_hik_devices", None) is not None:
+        is_hik = (self._current_source() == "hik")
+        if getattr(self, "hik_index_combo", None) is not None:
             device_count = len(self.hik_devices)
-            if device_count > 1:
-                names = [f"摄像头{idx + 1}" for idx in range(device_count)]
-                self.lbl_hik_devices.setText(", ".join(names))
-                self.lbl_hik_devices.setVisible(True)
-            elif device_count == 0:
-                self.lbl_hik_devices.setText("未发现")
-                self.lbl_hik_devices.setVisible(True)
-            else:
-                self.lbl_hik_devices.setText("—")
-                self.lbl_hik_devices.setVisible(False)
+            enable_combo = device_count > 1 and is_hik
+            self.hik_index_combo.setEnabled(enable_combo)
+            self.btn_hik_refresh.setEnabled(is_hik)
+            if device_count == 0:
+                self.hik_index_combo.clear()
 
     def _update_control_buttons_enabled(self):
         is_hik = (self._current_source() == "hik")
@@ -1123,6 +1146,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.usb_index = int(data)
         if self._current_source() == "usb":
             self._start_camera()
+
+    def _on_hik_index_changed(self, index: int):
+        if index < 0:
+            return
+        data = self.hik_index_combo.itemData(index)
+        if data is None:
+            return
+        self.hik_index = int(data)
 
     def _on_auto_adjust_clicked(self):
         target = None
