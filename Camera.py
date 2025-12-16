@@ -123,7 +123,19 @@ def safe_load_json(path: str, default):
 
 
 def load_config(path: str = CONFIG_PATH) -> Dict:
-    cfg = safe_load_json(path, default=None)
+    cfg = None
+    search_paths = []
+    if path:
+        search_paths.append(path)
+        res_path = resource_path(path)
+        if res_path != path:
+            search_paths.append(res_path)
+
+    for candidate in search_paths:
+        cfg = safe_load_json(candidate, default=None)
+        if cfg:
+            break
+
     if not cfg:
         cfg = {
             "server": {"host": "0.0.0.0", "port": 502},
@@ -816,6 +828,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combo_style.currentIndexChanged.connect(self._on_yolo_style_changed)
         yolo_form.addRow("框样式：", self.combo_style)
 
+        # Modbus 分组
+        gb_modbus = QtWidgets.QGroupBox("Modbus")
+        left_lay.addWidget(gb_modbus)
+        modbus_form = QtWidgets.QFormLayout(gb_modbus)
+        modbus_form.setContentsMargins(10, 10, 10, 10)
+        modbus_form.setSpacing(8)
+
+        self.lbl_modbus_status = QtWidgets.QLabel("—")
+        self.lbl_modbus_reg1 = QtWidgets.QLabel("—")
+        modbus_form.addRow("状态：", self.lbl_modbus_status)
+        modbus_form.addRow("寄存器1：", self.lbl_modbus_reg1)
+
         left_lay.addStretch(1)
 
         # 右侧
@@ -849,6 +873,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.toast_timer = QtCore.QTimer(self)
         self.toast_timer.setSingleShot(True)
         self.toast_timer.timeout.connect(lambda: self.status_label.setText(""))
+
+        self.modbus_ui_timer = QtCore.QTimer(self)
+        self.modbus_ui_timer.setInterval(800)
+        self.modbus_ui_timer.timeout.connect(self._refresh_modbus_status)
+        self.modbus_ui_timer.start()
+        self._refresh_modbus_status()
 
         self._refresh_usb_indices()
         self._update_usb_controls_enabled()
@@ -1274,6 +1304,30 @@ class MainWindow(QtWidgets.QMainWindow):
         if not model:
             return
         model.set_register(RESULT_REGISTER_ADDR, int(value) & 0xFFFF)
+        self._refresh_modbus_status()
+
+    def _refresh_modbus_status(self):
+        status_text = "未启动"
+        if getattr(self, "modbus_error", None):
+            status_text = f"错误: {self.modbus_error}"
+        elif getattr(self, "modbus_server", None):
+            status_text = f"运行中 {self.modbus_host}:{self.modbus_port}"
+
+        if getattr(self, "lbl_modbus_status", None) is not None:
+            self.lbl_modbus_status.setText(status_text)
+
+        reg_val = None
+        model = getattr(self, "modbus_model", None)
+        if model:
+            try:
+                vals = model.read(RESULT_REGISTER_ADDR, 1)
+                reg_val = vals[0] if vals else None
+            except Exception:
+                reg_val = None
+
+        reg_text = "—" if reg_val is None else f"{reg_val} (0x{int(reg_val) & 0xFFFF:04X})"
+        if getattr(self, "lbl_modbus_reg1", None) is not None:
+            self.lbl_modbus_reg1.setText(reg_text)
 
     def _handle_recognition_request(self):
         result_value = self._run_yolo_recognition()
@@ -1302,6 +1356,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         self.modbus_server = None
+        self._refresh_modbus_status()
 
     def _start_modbus_server(self, host: Optional[str] = None):
         if host is not None:
@@ -1316,6 +1371,7 @@ class MainWindow(QtWidgets.QMainWindow):
             print(f"[MODBUS] 启动失败: {exc}")
             self.modbus_server = None
             self.modbus_error = str(exc)
+        self._refresh_modbus_status()
 
     def _toast(self, text: str, ms: int = 2200):
         self.status_label.setText(text)
