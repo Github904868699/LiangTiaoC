@@ -253,10 +253,26 @@ def enumerate_hik_devices() -> List[tuple]:
     if not HIK_SDK_AVAILABLE or MvCamera is None:
         return []
 
+    initialized = False
     dev_list = MV_CC_DEVICE_INFO_LIST()
-    ret = MvCamera.MV_CC_EnumDevices(MV_GIGE_DEVICE, dev_list)
-    if ret != MV_OK or dev_list.nDeviceNum == 0:
-        return []
+
+    try:
+        try:
+            ret_init = MvCamera.MV_CC_Initialize()
+            initialized = (ret_init == MV_OK)
+        except Exception as exc:
+            print(f"[HIK] SDK 初始化失败: {exc}")
+            return []
+
+        ret = MvCamera.MV_CC_EnumDevices(MV_GIGE_DEVICE, dev_list)
+        if ret != MV_OK or dev_list.nDeviceNum == 0:
+            return []
+    finally:
+        if initialized:
+            try:
+                MvCamera.MV_CC_Finalize()
+            except Exception:
+                pass
 
     local_ip_int = None
     try:
