@@ -108,6 +108,54 @@ except Exception as exc:  # pragma: no cover
     HIK_SDK_IMPORT_ERROR = exc
 
 
+_hik_sdk_lock = threading.Lock()
+_hik_sdk_refcount = 0
+
+
+def _hik_sdk_acquire() -> bool:
+    global _hik_sdk_refcount
+    if not HIK_SDK_AVAILABLE or MvCamera is None:
+        return False
+    with _hik_sdk_lock:
+        if _hik_sdk_refcount == 0:
+            try:
+                ret = MvCamera.MV_CC_Initialize()
+            except Exception as exc:
+                print(f"[HIK] SDK 初始化异常: {exc}")
+                return False
+            if ret != MV_OK:
+                print(f"[HIK] SDK 初始化失败: 0x{ret:08X}")
+                return False
+        _hik_sdk_refcount += 1
+        return True
+
+
+def _hik_sdk_release():
+    global _hik_sdk_refcount
+    if not HIK_SDK_AVAILABLE or MvCamera is None:
+        return
+    with _hik_sdk_lock:
+        if _hik_sdk_refcount <= 0:
+            _hik_sdk_refcount = 0
+            return
+        _hik_sdk_refcount -= 1
+        if _hik_sdk_refcount == 0:
+            try:
+                MvCamera.MV_CC_Finalize()
+            except Exception:
+                pass
+
+
+class _HikSDKGuard:
+    def __enter__(self):
+        self._acquired = _hik_sdk_acquire()
+        return self._acquired
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._acquired:
+            _hik_sdk_release()
+
+
 # ---------------------- Helpers ----------------------
 def resource_path(rel: str) -> str:
     """打包后获取资源路径（图标 / best.pt）"""
@@ -253,26 +301,15 @@ def enumerate_hik_devices() -> List[tuple]:
     if not HIK_SDK_AVAILABLE or MvCamera is None:
         return []
 
-    initialized = False
     dev_list = MV_CC_DEVICE_INFO_LIST()
 
-    try:
-        try:
-            ret_init = MvCamera.MV_CC_Initialize()
-            initialized = (ret_init == MV_OK)
-        except Exception as exc:
-            print(f"[HIK] SDK 初始化失败: {exc}")
+    with _HikSDKGuard() as ok:
+        if not ok:
             return []
 
         ret = MvCamera.MV_CC_EnumDevices(MV_GIGE_DEVICE, dev_list)
         if ret != MV_OK or dev_list.nDeviceNum == 0:
             return []
-    finally:
-        if initialized:
-            try:
-                MvCamera.MV_CC_Finalize()
-            except Exception:
-                pass
 
     local_ip_int = None
     try:
@@ -644,97 +681,91 @@ class HikGrabber(QtCore.QThread):
         self._running = False
 
     def run(self):
-        initialized = False
         try:
-            ret = MvCamera.MV_CC_Initialize()
-            if ret != MV_OK:
-                raise RuntimeError(f"初始化海康 SDK 失败: 0x{ret:08X}")
-            initialized = True
+            with _HikSDKGuard() as ok:
+                if not ok:
+                    raise RuntimeError("初始化海康 SDK 失败")
 
-            devices = enumerate_hik_devices()
-            if not devices:
-                raise RuntimeError("未发现可用的海康相机")
+                try:
+                    devices = enumerate_hik_devices()
+                    if not devices:
+                        raise RuntimeError("未发现可用的海康相机")
 
-            if self.device_index >= len(devices):
-                raise RuntimeError(f"海康相机索引 {self.device_index + 1} 不存在")
+                    if self.device_index >= len(devices):
+                        raise RuntimeError(f"海康相机索引 {self.device_index + 1} 不存在")
 
-            device_info, display_name, _ = devices[self.device_index]
-            self.camera = MvCamera()
+                    device_info, display_name, _ = devices[self.device_index]
+                    self.camera = MvCamera()
 
-            ret = self.camera.MV_CC_CreateHandle(device_info)
-            if ret != MV_OK:
-                raise RuntimeError(f"创建相机句柄失败: 0x{ret:08X}")
+                    ret = self.camera.MV_CC_CreateHandle(device_info)
+                    if ret != MV_OK:
+                        raise RuntimeError(f"创建相机句柄失败: 0x{ret:08X}")
 
-            ret = self.camera.MV_CC_OpenDevice(MV_ACCESS_Exclusive, 0)
-            if ret != MV_OK:
-                raise RuntimeError(f"打开相机失败: 0x{ret:08X}")
+                    ret = self.camera.MV_CC_OpenDevice(MV_ACCESS_Exclusive, 0)
+                    if ret != MV_OK:
+                        raise RuntimeError(f"打开相机失败: 0x{ret:08X}")
 
-            self._prepare_payload()
+                    self._prepare_payload()
 
-            ret = self.camera.MV_CC_StartGrabbing()
-            if ret != MV_OK:
-                raise RuntimeError(f"启动取流失败: 0x{ret:08X}")
+                    ret = self.camera.MV_CC_StartGrabbing()
+                    if ret != MV_OK:
+                        raise RuntimeError(f"启动取流失败: 0x{ret:08X}")
 
-            width = self._get_int_value("Width")
-            height = self._get_int_value("Height")
-            if width and height:
-                self.infoSignal.emit(f"[INFO] HIK | {display_name} | {width}x{height}")
-            else:
-                self.infoSignal.emit(f"[INFO] HIK | {display_name}")
+                    width = self._get_int_value("Width")
+                    height = self._get_int_value("Height")
+                    if width and height:
+                        self.infoSignal.emit(f"[INFO] HIK | {display_name} | {width}x{height}")
+                    else:
+                        self.infoSignal.emit(f"[INFO] HIK | {display_name}")
 
-            self._running = True
-            frame_info = MV_FRAME_OUT_INFO_EX()
+                    self._running = True
+                    frame_info = MV_FRAME_OUT_INFO_EX()
 
-            grabbed = 0
-            last_fps_ts = time.time()
-            self._last_emit_ts = 0.0
-
-            while self._running:
-                ret = self.camera.MV_CC_GetOneFrameTimeout(
-                    self._data_ptr, self._payload_size, frame_info, 1000
-                )
-                if ret != MV_OK:
-                    if ret != self._last_stream_error:
-                        self.infoSignal.emit(f"[HIK] 取流异常: 0x{ret:08X}")
-                        self._last_stream_error = ret
-                    continue
-
-                self._last_stream_error = 0
-                now = time.time()
-                grabbed += 1
-
-                if (now - self._last_emit_ts) < (1.0 / UI_TARGET_FPS):
-                    if (now - last_fps_ts) >= 1.0:
-                        self.infoSignal.emit(f"[FPS] {grabbed / (now - last_fps_ts):.1f}")
-                        grabbed = 0
-                        last_fps_ts = now
-                    continue
-
-                frame = self._convert_frame(frame_info)
-                if frame is None:
-                    continue
-
-                self._last_emit_ts = now
-                self.frameSignal.emit(frame)
-
-                if (now - last_fps_ts) >= 1.0:
-                    self.infoSignal.emit(f"[FPS] {grabbed / (now - last_fps_ts):.1f}")
                     grabbed = 0
-                    last_fps_ts = now
+                    last_fps_ts = time.time()
+                    self._last_emit_ts = 0.0
 
-                QtCore.QThread.msleep(1)
+                    while self._running:
+                        ret = self.camera.MV_CC_GetOneFrameTimeout(
+                            self._data_ptr, self._payload_size, frame_info, 1000
+                        )
+                        if ret != MV_OK:
+                            if ret != self._last_stream_error:
+                                self.infoSignal.emit(f"[HIK] 取流异常: 0x{ret:08X}")
+                                self._last_stream_error = ret
+                            continue
+
+                        self._last_stream_error = 0
+                        now = time.time()
+                        grabbed += 1
+
+                        if (now - self._last_emit_ts) < (1.0 / UI_TARGET_FPS):
+                            if (now - last_fps_ts) >= 1.0:
+                                self.infoSignal.emit(f"[FPS] {grabbed / (now - last_fps_ts):.1f}")
+                                grabbed = 0
+                                last_fps_ts = now
+                            continue
+
+                        frame = self._convert_frame(frame_info)
+                        if frame is None:
+                            continue
+
+                        self._last_emit_ts = now
+                        self.frameSignal.emit(frame)
+
+                        if (now - last_fps_ts) >= 1.0:
+                            self.infoSignal.emit(f"[FPS] {grabbed / (now - last_fps_ts):.1f}")
+                            grabbed = 0
+                            last_fps_ts = now
+
+                        QtCore.QThread.msleep(1)
+                finally:
+                    self._cleanup_camera()
 
         except Exception as exc:
             self._running = False
             self.infoSignal.emit(f"[HIK] {exc}")
             self.errorSignal.emit(str(exc))
-        finally:
-            self._cleanup_camera()
-            if initialized:
-                try:
-                    MvCamera.MV_CC_Finalize()
-                except Exception:
-                    pass
 
 
 class UsbGrabber(QtCore.QThread):
